@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.o
+*.so
+
+# Generated locally — regenerate with the commands in README.md, never committed
+testdata/
+results/
+
+# Compiled CUDA smoke-test binary
+test_int8
+
+# Profiler raw streams / intermediates
+*.qdstrm
+*.nsys-rep
+*.sqlite
