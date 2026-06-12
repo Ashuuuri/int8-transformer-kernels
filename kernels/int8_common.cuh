@@ -40,6 +40,14 @@ __device__ __forceinline__ void i8_cp_async_wait_all() {
 #endif
 }
 
+// Wait until at most one async group remains in flight (double-buffer use:
+// blocks on tile t while tile t+1 keeps loading in hardware).
+__device__ __forceinline__ void i8_cp_async_wait_one() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
+}
+
 // ── quant_utils.cu public interface ───────────────────────────────────
 // Quantize FP16 → INT8 with dynamically-computed per-tensor scale.
 // d_scale[0] (device) receives the computed scale after the call.

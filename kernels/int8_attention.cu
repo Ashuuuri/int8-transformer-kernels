@@ -6,10 +6,14 @@
 //   V dequant row r: V_fp16[r][c] = V_int8[r][c] * scale_V[r]
 //   Output is FP16 (can't factor out a single scale from weighted V rows).
 //
-// Two paths:
-//   WMMA path  (INT8_ATTN_WMMA=1, default):
-//     Q,K in smem as INT8 → INT8 WMMA for QK^T (INT32 accum)
-//     Per-element scale, online softmax, FP16 WMMA for attn×V
+// Three paths:
+//   Double-buffered WMMA path (INT8_ATTN_DB=1, default):
+//     cp.async double-buffers K/V (INT8) so tile t+1 loads while tile t
+//     computes; V dequantized smem→smem after QK^T. TILE_KV: 64 for
+//     head_dim≤128, 32 up to head_dim=256.
+//
+//   Single-buffer WMMA path (INT8_ATTN_DB=0, or seq_len not divisible):
+//     load → sync → compute → sync, no overlap.
 //     Template TILE_KV: 128 for head_dim≤128 (2 blocks/SM), 64 for head_dim=256.
 //
 //   Scalar path (INT8_ATTN_WMMA=0, or non-aligned dims):
@@ -24,6 +28,24 @@
 
 #ifndef INT8_ATTN_WMMA
 #define INT8_ATTN_WMMA 1
+#endif
+
+// cp.async double-buffered WMMA path. Measured SLOWER than the single-buffer
+// kernel on A100 (0.58-0.82x): fitting two K/V buffers in smem forces TILE_KV
+// from 128/64 down to 64/32, and the doubled per-tile overhead (softmax
+// rescale of frag_out, warp shuffles, +1 barrier) outweighs the overlap.
+// Kept for ablation; off by default.
+#ifndef INT8_ATTN_DB
+#define INT8_ATTN_DB 0
+#endif
+
+// V register prefetch: issue V's global loads at tile start so the QK^T MMAs
+// hide their latency, then dequantize registers → smem afterwards. Measured
+// SLOWER on A100 (0.75-0.9x): the extra block-wide barrier before attn×V
+// costs more than the hidden latency — warp parallelism already covers the
+// V loads. Kept for ablation; off by default.
+#ifndef INT8_ATTN_VPREFETCH
+#define INT8_ATTN_VPREFETCH 0
 #endif
 
 // ── Scalar path ─────────────────────────────────────────────────────────
@@ -142,7 +164,11 @@ using namespace nvcuda::wmma;
 
 // TILE_KV is a template parameter: 128 for head_dim≤128, 64 for head_dim=256.
 // Larger tiles → fewer iterations → less overhead → better perf.
-template <int TILE_KV>
+// HEAD_DIM is also a template parameter: with it compile-time constant, every
+// fragment-array index unrolls and frag_out lives in registers — a runtime
+// head_dim forces frag_out[] into local memory, which costs a load+store per
+// MMA and per softmax-rescale step.
+template <int TILE_KV, int HEAD_DIM>
 __global__ __launch_bounds__(ATTN_BDIM, 2)
 void int8_wmma_attention_kernel(
     const int8_t* __restrict__ Q,
@@ -152,9 +178,10 @@ void int8_wmma_attention_kernel(
     const float* __restrict__ d_scale_Q,   // [batch*heads*seq_len]
     const float* __restrict__ d_scale_K,   // [batch*heads*seq_len]
     const float* __restrict__ d_scale_V,   // [batch*heads*seq_len]
-    int seq_len, int head_dim,
+    int seq_len,
     float attn_scale
 ) {
+    constexpr int head_dim = HEAD_DIM;
     const int bh      = blockIdx.y;
     const int qi_base = blockIdx.x * ATTN_TILE_Q;
     const int tid     = threadIdx.x;
@@ -208,11 +235,12 @@ void int8_wmma_attention_kernel(
     float rmax0 = -1e38f, rmax1 = -1e38f;
     float rsum0 = 0.f,    rsum1 = 0.f;
 
-    const int n_slices    = head_dim / ATTN_WMMA_N;
-    const int n_kv_groups = TILE_KV / ATTN_WMMA_N;
-    const int kv_vecs     = TILE_KV * head_dim / 16;
+    constexpr int n_slices    = HEAD_DIM / ATTN_WMMA_N;
+    constexpr int n_kv_groups = TILE_KV / ATTN_WMMA_N;
+    constexpr int kv_vecs     = TILE_KV * HEAD_DIM / 16;
 
-    fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, float> frag_out[ATTN_MAX_SLICES];
+    fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, float> frag_out[n_slices];
+    #pragma unroll
     for (int s = 0; s < n_slices; ++s) fill_fragment(frag_out[s], 0.f);
 
     const int num_tiles = seq_len / TILE_KV;
@@ -220,11 +248,34 @@ void int8_wmma_attention_kernel(
     __syncthreads();  // ensure Q load is complete
 
     // ── Main loop: load → sync → compute → sync ──
+    // Up to 8 16-byte V vectors per thread across supported configs
+    // (TILE_KV * head_dim / 16 / ATTN_BDIM ≤ 8 for head_dim ≤ 256).
+    #define ATTN_V_REGS 8
+
     for (int t = 0; t < num_tiles; ++t) {
         const int ts = t * TILE_KV;
         const size_t kv_base = ((size_t)bh * seq_len + ts) * head_dim;
         const size_t scale_base = (size_t)bh * seq_len + ts;
 
+#if INT8_ATTN_VPREFETCH
+        // Load K (INT8) into smem; issue V loads into registers so the QK^T
+        // MMAs below hide their global latency.
+        int4  v_regs[ATTN_V_REGS];
+        float v_scales[ATTN_V_REGS];
+        #pragma unroll
+        for (int r = 0; r < ATTN_V_REGS; ++r) {
+            const int vi = tid + r * ATTN_BDIM;
+            if (vi >= kv_vecs) break;
+            const int byte_off = vi * 16;
+            const int row = byte_off / head_dim;
+            const int col = byte_off % head_dim;
+            const size_t goff = kv_base + row * head_dim + col;
+            *reinterpret_cast<int4*>(&s_K_i8[row * ks_i8 + col]) =
+                *reinterpret_cast<const int4*>(&K[goff]);
+            v_regs[r]   = *reinterpret_cast<const int4*>(&V[goff]);
+            v_scales[r] = __ldg(&d_scale_V[scale_base + row]);
+        }
+#else
         // Load K (INT8), V (INT8→FP16 dequant), K_scales
         for (int vi = tid; vi < kv_vecs; vi += ATTN_BDIM) {
             const int byte_off = vi * 16;
@@ -246,26 +297,53 @@ void int8_wmma_attention_kernel(
                     __float2half((float)vb[2*i + 1] * sv));
             }
         }
+#endif
         for (int idx = tid; idx < TILE_KV; idx += ATTN_BDIM) {
             s_scale_K[idx] = __ldg(&d_scale_K[scale_base + idx]);
         }
         __syncthreads();
 
         // ── QK^T via INT8 WMMA → INT32 accumulator ──
+        // k outer / g inner: each Q fragment is loaded once per k-step and
+        // reused across all KV groups (was reloaded n_kv_groups times).
         fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int32_t>
             frag_qk[TILE_KV / ATTN_WMMA_N];
         #pragma unroll
-        for (int g = 0; g < n_kv_groups; ++g) {
+        for (int g = 0; g < n_kv_groups; ++g)
             fill_fragment(frag_qk[g], (int32_t)0);
-            #pragma unroll 4
-            for (int k = 0; k < head_dim; k += ATTN_WMMA_K) {
-                fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fq;
+        #pragma unroll 4
+        for (int k = 0; k < head_dim; k += ATTN_WMMA_K) {
+            fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fq;
+            load_matrix_sync(fq, s_Q_i8 + warp_id * ATTN_WMMA_M * ks_i8 + k, ks_i8);
+            #pragma unroll
+            for (int g = 0; g < n_kv_groups; ++g) {
                 fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, col_major> fk;
-                load_matrix_sync(fq, s_Q_i8 + warp_id * ATTN_WMMA_M * ks_i8 + k, ks_i8);
-                load_matrix_sync(fk, s_K_i8 + g * ATTN_WMMA_N * ks_i8 + k,       ks_i8);
+                load_matrix_sync(fk, s_K_i8 + g * ATTN_WMMA_N * ks_i8 + k, ks_i8);
                 mma_sync(frag_qk[g], fq, fk, frag_qk[g]);
             }
         }
+
+#if INT8_ATTN_VPREFETCH
+        // Dequantize the prefetched V registers → s_V_fp16. The loads were
+        // issued before QK^T, so they have already landed by now.
+        #pragma unroll
+        for (int r = 0; r < ATTN_V_REGS; ++r) {
+            const int vi = tid + r * ATTN_BDIM;
+            if (vi >= kv_vecs) break;
+            const int byte_off = vi * 16;
+            const int row = byte_off / head_dim;
+            const int col = byte_off % head_dim;
+            const float sv = v_scales[r];
+            const int8_t* vb = reinterpret_cast<const int8_t*>(&v_regs[r]);
+            half* vdst = &s_V_fp16[row * vs + col];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
+                    __float2half((float)vb[2*i]     * sv),
+                    __float2half((float)vb[2*i + 1] * sv));
+            }
+        }
+#endif
 
         // Cast INT32 accumulators to float with per-element scaling.
         float sf[TILE_KV / ATTN_WMMA_N][8];
@@ -300,6 +378,7 @@ void int8_wmma_attention_kernel(
         const float new_max1 = fmaxf(rmax1, lmax1), corr1 = __expf(rmax1 - new_max1);
         rmax0 = new_max0; rmax1 = new_max1;
         rsum0 *= corr0;   rsum1 *= corr1;
+        #pragma unroll
         for (int s = 0; s < n_slices; ++s) {
             frag_out[s].x[0]*=corr0; frag_out[s].x[1]*=corr0;
             frag_out[s].x[2]*=corr1; frag_out[s].x[3]*=corr1;
@@ -331,7 +410,286 @@ void int8_wmma_attention_kernel(
         rsum0 += lsum0;  rsum1 += lsum1;
 
         // attn × V via FP16 WMMA.
+#if INT8_ATTN_VPREFETCH
+        __syncthreads();  // s_V_fp16 was written block-wide after QK^T
+#else
         __syncwarp();
+#endif
+        // k outer / s inner: each scores fragment is loaded once per k-step
+        // and reused across all head_dim slices (was reloaded n_slices times).
+        #pragma unroll
+        for (int k = 0; k < TILE_KV; k += ATTN_WMMA_K) {
+            fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fw;
+            load_matrix_sync(fw, s_scores + warp_id * ATTN_WMMA_M * ss + k, ss);
+            #pragma unroll
+            for (int s = 0; s < n_slices; ++s) {
+                fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, half, row_major> fv;
+                load_matrix_sync(fv, s_V_fp16 + k * vs + s * ATTN_WMMA_N, vs);
+                mma_sync(frag_out[s], fw, fv, frag_out[s]);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Normalize and write FP16 output.
+    const float inv0 = 1.f / rsum0, inv1 = 1.f / rsum1;
+    #pragma unroll
+    for (int s = 0; s < n_slices; ++s) {
+        const int d    = s * ATTN_WMMA_N;
+        const int qi0  = qi_base + warp_id * ATTN_WMMA_M + frow0;
+        const int qi1  = qi_base + warp_id * ATTN_WMMA_M + frow1;
+        const size_t b0 = ((size_t)bh * seq_len + qi0) * head_dim;
+        const size_t b1 = ((size_t)bh * seq_len + qi1) * head_dim;
+        if (qi0 < seq_len) {
+            out[b0+d+fcol_lo]   = __float2half(frag_out[s].x[0]*inv0);
+            out[b0+d+fcol_lo+1] = __float2half(frag_out[s].x[1]*inv0);
+            out[b0+d+fcol_lo+8] = __float2half(frag_out[s].x[4]*inv0);
+            out[b0+d+fcol_lo+9] = __float2half(frag_out[s].x[5]*inv0);
+        }
+        if (qi1 < seq_len) {
+            out[b1+d+fcol_lo]   = __float2half(frag_out[s].x[2]*inv1);
+            out[b1+d+fcol_lo+1] = __float2half(frag_out[s].x[3]*inv1);
+            out[b1+d+fcol_lo+8] = __float2half(frag_out[s].x[6]*inv1);
+            out[b1+d+fcol_lo+9] = __float2half(frag_out[s].x[7]*inv1);
+        }
+    }
+}
+
+// ── WMMA path with cp.async double buffering ──────────────────────────
+// While tile t is being processed, tile t+1's K and V load asynchronously
+// (global → smem, bypassing registers). K stays INT8 in smem for the INT8
+// QK^T WMMA. V is staged as INT8, then dequantized to an FP16 buffer after
+// the QK^T MMAs of the same tile (a cheap smem→smem pass), so the slow
+// synchronous global load + dequant of the single-buffer kernel disappears
+// from the critical path.
+//
+// Smem (dynamic):
+//   s_Q_i8     [TILE_Q  * ks_i8]        INT8
+//   s_K_i8     [2][TILE_KV * ks_i8]     INT8, double-buffered (cp.async)
+//   s_V_i8     [2][TILE_KV * ks_i8]     INT8, double-buffered (cp.async)
+//   s_V_fp16   [TILE_KV * vs]           FP16, rebuilt per tile
+//   s_scores   [TILE_Q  * ss]           FP16
+//   s_scale_K  [TILE_KV]                float, reloaded per tile
+//
+// TILE_KV=64 fits 2 blocks/SM up to head_dim=128 (73 KB); TILE_KV=32
+// covers head_dim up to 256 (74 KB). Larger head_dims fall back.
+template <int TILE_KV>
+__global__ __launch_bounds__(ATTN_BDIM, 2)
+void int8_wmma_attention_db_kernel(
+    const int8_t* __restrict__ Q,
+    const int8_t* __restrict__ K,
+    const int8_t* __restrict__ V,
+    half* __restrict__         out,
+    const float* __restrict__ d_scale_Q,
+    const float* __restrict__ d_scale_K,
+    const float* __restrict__ d_scale_V,
+    int seq_len, int head_dim,
+    float attn_scale
+) {
+    const int bh      = blockIdx.y;
+    const int qi_base = blockIdx.x * ATTN_TILE_Q;
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane    = tid % 32;
+
+    extern __shared__ char smem_raw[];
+    const int ks_i8 = head_dim + ATTN_I8_PAD;
+    const int vs    = head_dim + ATTN_SMEM_PAD;
+    const int ss    = TILE_KV + ATTN_SMEM_PAD;
+
+    int8_t* s_Q_i8   = (int8_t*) smem_raw;
+    int8_t* s_K_i8_0 = s_Q_i8 + ATTN_TILE_Q * ks_i8;
+    int8_t* s_K_i8_1 = s_K_i8_0 + TILE_KV * ks_i8;
+    int8_t* s_V_i8_0 = s_K_i8_1 + TILE_KV * ks_i8;
+    int8_t* s_V_i8_1 = s_V_i8_0 + TILE_KV * ks_i8;
+    half*   s_V_fp16 = (half*)(s_V_i8_1 + TILE_KV * ks_i8);
+    half*   s_scores = s_V_fp16 + TILE_KV * vs;
+    float*  s_scale_K = (float*)(s_scores + ATTN_TILE_Q * ss);
+
+    // Load Q tile as INT8 (vectorized 16-byte loads).
+    {
+        const int q_vecs = ATTN_TILE_Q * head_dim / 16;
+        const int4 zero4 = make_int4(0, 0, 0, 0);
+        for (int vi = tid; vi < q_vecs; vi += ATTN_BDIM) {
+            const int byte_off = vi * 16;
+            const int row = byte_off / head_dim;
+            const int col = byte_off % head_dim;
+            const int qi  = qi_base + row;
+            int4 val = (qi < seq_len)
+                ? *reinterpret_cast<const int4*>(&Q[((size_t)bh * seq_len + qi) * head_dim + col])
+                : zero4;
+            *reinterpret_cast<int4*>(&s_Q_i8[row * ks_i8 + col]) = val;
+        }
+    }
+
+    const int frow0   = lane / 4;
+    const int frow1   = lane / 4 + 8;
+    const int fcol_lo = (lane % 4) * 2;
+
+    const int qi0_global = qi_base + warp_id * ATTN_WMMA_M + frow0;
+    const int qi1_global = qi_base + warp_id * ATTN_WMMA_M + frow1;
+    const float r_sQ0 = (qi0_global < seq_len)
+        ? __ldg(&d_scale_Q[bh * seq_len + qi0_global]) * attn_scale : 0.f;
+    const float r_sQ1 = (qi1_global < seq_len)
+        ? __ldg(&d_scale_Q[bh * seq_len + qi1_global]) * attn_scale : 0.f;
+
+    float rmax0 = -1e38f, rmax1 = -1e38f;
+    float rsum0 = 0.f,    rsum1 = 0.f;
+
+    const int n_slices    = head_dim / ATTN_WMMA_N;
+    const int n_kv_groups = TILE_KV / ATTN_WMMA_N;
+    const int kv_vecs     = TILE_KV * head_dim / 16;
+
+    fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, float> frag_out[ATTN_MAX_SLICES];
+    for (int s = 0; s < n_slices; ++s) fill_fragment(frag_out[s], 0.f);
+
+    const int num_tiles = seq_len / TILE_KV;
+
+    // Kick off tile 0's K+V loads before entering the loop.
+    {
+        const size_t base = ((size_t)bh * seq_len) * head_dim;
+        for (int vi = tid; vi < kv_vecs; vi += ATTN_BDIM) {
+            const int byte_off = vi * 16;
+            const int row = byte_off / head_dim;
+            const int col = byte_off % head_dim;
+            i8_cp_async_16B(s_K_i8_0 + row * ks_i8 + col, K + base + row * head_dim + col);
+            i8_cp_async_16B(s_V_i8_0 + row * ks_i8 + col, V + base + row * head_dim + col);
+        }
+        i8_cp_async_commit();
+    }
+
+    __syncthreads();  // Q visible (cp.async groups handled separately)
+
+    for (int t = 0; t < num_tiles; ++t) {
+        const int ts = t * TILE_KV;
+        const size_t scale_base = (size_t)bh * seq_len + ts;
+
+        int8_t* s_K_cur = (t % 2 == 0) ? s_K_i8_0 : s_K_i8_1;
+        int8_t* s_V_cur = (t % 2 == 0) ? s_V_i8_0 : s_V_i8_1;
+        int8_t* s_K_nxt = (t % 2 == 0) ? s_K_i8_1 : s_K_i8_0;
+        int8_t* s_V_nxt = (t % 2 == 0) ? s_V_i8_1 : s_V_i8_0;
+
+        // Issue tile t+1's loads, then block until tile t is resident.
+        if (t + 1 < num_tiles) {
+            const size_t base = ((size_t)bh * seq_len + ts + TILE_KV) * head_dim;
+            for (int vi = tid; vi < kv_vecs; vi += ATTN_BDIM) {
+                const int byte_off = vi * 16;
+                const int row = byte_off / head_dim;
+                const int col = byte_off % head_dim;
+                i8_cp_async_16B(s_K_nxt + row * ks_i8 + col, K + base + row * head_dim + col);
+                i8_cp_async_16B(s_V_nxt + row * ks_i8 + col, V + base + row * head_dim + col);
+            }
+            i8_cp_async_commit();
+            i8_cp_async_wait_one();   // tile t done; tile t+1 stays in flight
+        } else {
+            i8_cp_async_wait_all();
+        }
+        // K scales for tile t (tiny, L2-resident).
+        for (int idx = tid; idx < TILE_KV; idx += ATTN_BDIM)
+            s_scale_K[idx] = __ldg(&d_scale_K[scale_base + idx]);
+        __syncthreads();  // [1/3] tile t's K/V (INT8) + scales visible
+
+        // ── QK^T via INT8 WMMA → INT32 accumulator ──
+        fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int32_t>
+            frag_qk[TILE_KV / ATTN_WMMA_N];
+        #pragma unroll
+        for (int g = 0; g < n_kv_groups; ++g) {
+            fill_fragment(frag_qk[g], (int32_t)0);
+            #pragma unroll 4
+            for (int k = 0; k < head_dim; k += ATTN_WMMA_K) {
+                fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fq;
+                fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, col_major> fk;
+                load_matrix_sync(fq, s_Q_i8 + warp_id * ATTN_WMMA_M * ks_i8 + k, ks_i8);
+                load_matrix_sync(fk, s_K_cur + g * ATTN_WMMA_N * ks_i8 + k,      ks_i8);
+                mma_sync(frag_qk[g], fq, fk, frag_qk[g]);
+            }
+        }
+
+        // ── Dequantize V: s_V_cur (INT8) → s_V_fp16 ──
+        // K tile is consumed by the MMAs above; V_fp16 from the previous
+        // tile was released at the loop-end barrier.
+        for (int vi = tid; vi < kv_vecs; vi += ATTN_BDIM) {
+            const int byte_off = vi * 16;
+            const int row = byte_off / head_dim;
+            const int col = byte_off % head_dim;
+            const float sv = __ldg(&d_scale_V[scale_base + row]);
+            int4 v_vec = *reinterpret_cast<const int4*>(&s_V_cur[row * ks_i8 + col]);
+            const int8_t* vb = reinterpret_cast<const int8_t*>(&v_vec);
+            half* vdst = &s_V_fp16[row * vs + col];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
+                    __float2half((float)vb[2*i]     * sv),
+                    __float2half((float)vb[2*i + 1] * sv));
+            }
+        }
+
+        // Cast INT32 accumulators to float with per-element scaling.
+        float sf[TILE_KV / ATTN_WMMA_N][8];
+        float lmax0 = -1e38f, lmax1 = -1e38f;
+        for (int g = 0; g < n_kv_groups; ++g) {
+            const int kc_base = g * ATTN_WMMA_N;
+            float sK_c0 = s_scale_K[kc_base + fcol_lo];
+            float sK_c1 = s_scale_K[kc_base + fcol_lo + 1];
+            float sK_c8 = s_scale_K[kc_base + fcol_lo + 8];
+            float sK_c9 = s_scale_K[kc_base + fcol_lo + 9];
+
+            sf[g][0] = (float)frag_qk[g].x[0] * r_sQ0 * sK_c0;
+            sf[g][1] = (float)frag_qk[g].x[1] * r_sQ0 * sK_c1;
+            sf[g][2] = (float)frag_qk[g].x[2] * r_sQ1 * sK_c0;
+            sf[g][3] = (float)frag_qk[g].x[3] * r_sQ1 * sK_c1;
+            sf[g][4] = (float)frag_qk[g].x[4] * r_sQ0 * sK_c8;
+            sf[g][5] = (float)frag_qk[g].x[5] * r_sQ0 * sK_c9;
+            sf[g][6] = (float)frag_qk[g].x[6] * r_sQ1 * sK_c8;
+            sf[g][7] = (float)frag_qk[g].x[7] * r_sQ1 * sK_c9;
+
+            lmax0 = fmaxf(lmax0, fmaxf(fmaxf(sf[g][0],sf[g][1]), fmaxf(sf[g][4],sf[g][5])));
+            lmax1 = fmaxf(lmax1, fmaxf(fmaxf(sf[g][2],sf[g][3]), fmaxf(sf[g][6],sf[g][7])));
+        }
+        lmax0 = fmaxf(lmax0, __shfl_xor_sync(0xffffffff, lmax0, 1));
+        lmax0 = fmaxf(lmax0, __shfl_xor_sync(0xffffffff, lmax0, 2));
+        lmax1 = fmaxf(lmax1, __shfl_xor_sync(0xffffffff, lmax1, 1));
+        lmax1 = fmaxf(lmax1, __shfl_xor_sync(0xffffffff, lmax1, 2));
+
+        const float new_max0 = fmaxf(rmax0, lmax0), corr0 = __expf(rmax0 - new_max0);
+        const float new_max1 = fmaxf(rmax1, lmax1), corr1 = __expf(rmax1 - new_max1);
+        rmax0 = new_max0; rmax1 = new_max1;
+        rsum0 *= corr0;   rsum1 *= corr1;
+        #pragma unroll
+        for (int s = 0; s < n_slices; ++s) {
+            frag_out[s].x[0]*=corr0; frag_out[s].x[1]*=corr0;
+            frag_out[s].x[2]*=corr1; frag_out[s].x[3]*=corr1;
+            frag_out[s].x[4]*=corr0; frag_out[s].x[5]*=corr0;
+            frag_out[s].x[6]*=corr1; frag_out[s].x[7]*=corr1;
+        }
+
+        // Softmax weights → s_scores (FP16, for attn × V WMMA).
+        float lsum0 = 0.f, lsum1 = 0.f;
+        for (int g = 0; g < n_kv_groups; ++g) {
+            const int qr0 = warp_id * ATTN_WMMA_M + frow0;
+            const int qr1 = warp_id * ATTN_WMMA_M + frow1;
+            const int kc  = g * ATTN_WMMA_N + fcol_lo;
+            const float w0=__expf(sf[g][0]-rmax0), w1=__expf(sf[g][1]-rmax0);
+            const float w8=__expf(sf[g][4]-rmax0), w9=__expf(sf[g][5]-rmax0);
+            lsum0 += w0+w1+w8+w9;
+            s_scores[qr0*ss+kc]=__float2half(w0); s_scores[qr0*ss+kc+1]=__float2half(w1);
+            s_scores[qr0*ss+kc+8]=__float2half(w8); s_scores[qr0*ss+kc+9]=__float2half(w9);
+            const float u0=__expf(sf[g][2]-rmax1), u1=__expf(sf[g][3]-rmax1);
+            const float u8=__expf(sf[g][6]-rmax1), u9=__expf(sf[g][7]-rmax1);
+            lsum1 += u0+u1+u8+u9;
+            s_scores[qr1*ss+kc]=__float2half(u0); s_scores[qr1*ss+kc+1]=__float2half(u1);
+            s_scores[qr1*ss+kc+8]=__float2half(u8); s_scores[qr1*ss+kc+9]=__float2half(u9);
+        }
+        lsum0 += __shfl_xor_sync(0xffffffff, lsum0, 1);
+        lsum0 += __shfl_xor_sync(0xffffffff, lsum0, 2);
+        lsum1 += __shfl_xor_sync(0xffffffff, lsum1, 1);
+        lsum1 += __shfl_xor_sync(0xffffffff, lsum1, 2);
+        rsum0 += lsum0;  rsum1 += lsum1;
+
+        __syncthreads();  // [2/3] s_V_fp16 fully written (block-wide)
+
+        // attn × V via FP16 WMMA.
         for (int s = 0; s < n_slices; ++s) {
             const int d_base = s * ATTN_WMMA_N;
             #pragma unroll
@@ -344,11 +702,12 @@ void int8_wmma_attention_kernel(
             }
         }
 
-        __syncthreads();
+        __syncthreads();  // [3/3] s_V_fp16 / s_scores reusable next tile
     }
 
     // Normalize and write FP16 output.
     const float inv0 = 1.f / rsum0, inv1 = 1.f / rsum1;
+    #pragma unroll
     for (int s = 0; s < n_slices; ++s) {
         const int d    = s * ATTN_WMMA_N;
         const int qi0  = qi_base + warp_id * ATTN_WMMA_M + frow0;
@@ -390,6 +749,38 @@ void int8_attention_forward(
         const int ks_i8_host = head_dim + ATTN_I8_PAD;
         const int vs_host    = head_dim + ATTN_SMEM_PAD;
 
+#if INT8_ATTN_DB
+        // Double-buffered path: Q + 2×K(INT8) + 2×V(INT8) + V(FP16) + scores + K scales.
+        auto calc_smem_db = [&](int tile_kv) -> size_t {
+            const int ss = tile_kv + ATTN_SMEM_PAD;
+            return (size_t)ATTN_TILE_Q * ks_i8_host +
+                   (size_t)2 * tile_kv * ks_i8_host * 2 +          // K + V INT8, ×2 buffers
+                   (size_t)tile_kv * vs_host * sizeof(half) +
+                   (size_t)ATTN_TILE_Q * ss * sizeof(half) +
+                   (size_t)tile_kv * sizeof(float);
+        };
+        // TILE_KV=64 → 73 KB at head_dim=128 (2 blocks/SM);
+        // TILE_KV=32 → 74 KB at head_dim=256.
+        const size_t smem_db64 = calc_smem_db(64);
+        if (seq_len % 64 == 0 && smem_db64 <= 82000) {
+            cudaFuncSetAttribute(int8_wmma_attention_db_kernel<64>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_db64);
+            int8_wmma_attention_db_kernel<64><<<grid, ATTN_BDIM, smem_db64>>>(
+                Q, K, V, out, scale_Q, scale_K, scale_V,
+                seq_len, head_dim, attn_scale);
+            return;
+        }
+        const size_t smem_db32 = calc_smem_db(32);
+        if (seq_len % 32 == 0 && smem_db32 <= 82000) {
+            cudaFuncSetAttribute(int8_wmma_attention_db_kernel<32>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_db32);
+            int8_wmma_attention_db_kernel<32><<<grid, ATTN_BDIM, smem_db32>>>(
+                Q, K, V, out, scale_Q, scale_K, scale_V,
+                seq_len, head_dim, attn_scale);
+            return;
+        }
+#endif  // INT8_ATTN_DB
+
         // Helper: compute smem for a given tile_kv
         auto calc_smem = [&](int tile_kv) -> size_t {
             const int ss = tile_kv + ATTN_SMEM_PAD;
@@ -400,30 +791,35 @@ void int8_attention_forward(
                    (size_t)tile_kv * sizeof(float);                // K_scales
         };
 
-        // Try TILE_KV=128 first (halves tile count → less loop overhead).
-        // Only when smem ≤ 82KB (2 blocks/SM). head_dim=256 needs 135KB → too much
-        // register pressure (frag_qk[8]+sf[8][8]+frag_out[16] ≈ 276 regs > 255 limit)
-        // and 1 block/SM kills latency hiding. Stick to TILE_KV=64 for head_dim=256.
+        // The kernel is templated on (TILE_KV, HEAD_DIM); head dims outside
+        // {64, 128, 256} fall through to the scalar path.
+        //
+        // TILE_KV=128 first (halves tile count → less loop overhead), when
+        // smem ≤ 82KB (2 blocks/SM). head_dim=256 needs 135KB → too much
+        // register pressure (frag_qk[8]+sf[8][8]+frag_out[16] ≈ 276 regs)
+        // and 1 block/SM kills latency hiding → TILE_KV=64 for head_dim=256.
+#define LAUNCH_I8_WMMA_ATTN(KV, HD, SMEM)                                     \
+        do {                                                                  \
+            cudaFuncSetAttribute(int8_wmma_attention_kernel<KV, HD>,          \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, \
+                                 (int)(SMEM));                                \
+            int8_wmma_attention_kernel<KV, HD><<<grid, ATTN_BDIM, SMEM>>>(    \
+                Q, K, V, out, scale_Q, scale_K, scale_V,                      \
+                seq_len, attn_scale);                                         \
+        } while (0)
+
         const size_t smem_128 = calc_smem(128);
         if (seq_len % 128 == 0 && smem_128 <= 82000) {
-            cudaFuncSetAttribute(int8_wmma_attention_kernel<128>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_128);
-            int8_wmma_attention_kernel<128><<<grid, ATTN_BDIM, smem_128>>>(
-                Q, K, V, out, scale_Q, scale_K, scale_V,
-                seq_len, head_dim, attn_scale);
-            return;
+            if (head_dim == 64)  { LAUNCH_I8_WMMA_ATTN(128, 64,  smem_128); return; }
+            if (head_dim == 128) { LAUNCH_I8_WMMA_ATTN(128, 128, smem_128); return; }
         }
-
-        // TILE_KV=64 (fits 2 blocks/SM up to head_dim=256, 78KB).
         if (seq_len % 64 == 0) {
             const size_t smem_64 = calc_smem(64);
-            cudaFuncSetAttribute(int8_wmma_attention_kernel<64>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_64);
-            int8_wmma_attention_kernel<64><<<grid, ATTN_BDIM, smem_64>>>(
-                Q, K, V, out, scale_Q, scale_K, scale_V,
-                seq_len, head_dim, attn_scale);
-            return;
+            if (head_dim == 64)  { LAUNCH_I8_WMMA_ATTN(64, 64,  smem_64); return; }
+            if (head_dim == 128) { LAUNCH_I8_WMMA_ATTN(64, 128, smem_64); return; }
+            if (head_dim == 256) { LAUNCH_I8_WMMA_ATTN(64, 256, smem_64); return; }
         }
+#undef LAUNCH_I8_WMMA_ATTN
     }
 #endif
 
