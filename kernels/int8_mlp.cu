@@ -11,6 +11,14 @@
 //
 // Ablation flags:
 //   INT8_MLP_STAGE_K=N   change K-stage depth (default 32)
+//   INT8_MLP_DYNAMIC=0   static per-tensor scales (worst-case bound
+//                        sx*sW1*d_model). Default 1: dynamic quantization —
+//                        per-token hidden scales computed in the GEMM1
+//                        epilogue (row absmax), per-tensor dynamic output
+//                        scale from the GEMM2 epilogue. The static bound is
+//                        ~sqrt(d_model) too conservative, wasting most of the
+//                        INT8 grid: max err grows 0.04 -> 0.49 over
+//                        d_model 512 -> 2048.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -18,7 +26,16 @@
 #include <cstdint>
 #include "int8_common.cuh"
 
+#ifndef INT8_MLP_DYNAMIC
+#define INT8_MLP_DYNAMIC 1
+#endif
+
 using namespace nvcuda;
+
+// atomicMax for non-negative floats via integer reinterpretation.
+__device__ __forceinline__ void atomic_max_pos_f32(float* addr, float val) {
+    atomicMax(reinterpret_cast<int*>(addr), __float_as_int(val));
+}
 
 // ── Tile / block shape ─────────────────────────────────────────────────
 #define WMMA_M  16
@@ -114,19 +131,32 @@ __device__ __forceinline__ void load_int8_tile_async(
     }
 }
 
-// ── INT8 WMMA GEMM → FP16 output ───────────────────────────────────────
-// C (FP16) = dequant( A (INT8) × B (INT8) )
-//   real[i,j] = int32_acc[i,j] * scale_A * scale_B   [+ GELU]
-template <bool apply_gelu>
-__global__ void gemm_int8_wmma_kernel(
+// ── INT8 WMMA GEMM → FP16 output (dynamic-quant building block) ────────
+// C (FP16) = dequant( A (INT8) × B (INT8) )   [+ GELU]
+//   a_scale_per_row=false: real[i,j] = acc[i,j] * scale_A[0]   * scale_B[0]
+//   a_scale_per_row=true:  real[i,j] = acc[i,j] * scale_A[row] * scale_B[0]
+// Optional epilogue statistics for dynamic quantization:
+//   d_row_absmax[M]: per-row absmax of C, accumulated via atomicMax
+//                    (GEMM1 → per-token hidden scales)
+//   d_out_absmax[1]: global absmax of C (GEMM2 → dynamic output scale)
+// Pass nullptr to skip either.
+// launch_bounds caps registers at 128 (= 2 blocks/SM with 256 threads);
+// without it the epilogue statistics push the kernel to 166 regs, which
+// halves occupancy and costs ~35% end-to-end.
+template <bool apply_gelu, bool a_scale_per_row>
+__global__ __launch_bounds__(THREADS_PER_BLOCK, 2)
+void gemm_int8_wmma_f16_kernel(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     half* __restrict__         C,
     int M, int N, int K,
     const float* __restrict__ d_scale_A,
-    const float* __restrict__ d_scale_B
+    const float* __restrict__ d_scale_B,
+    float* __restrict__ d_row_absmax,
+    float* __restrict__ d_out_absmax
 ) {
-    const float scale = __ldg(d_scale_A) * __ldg(d_scale_B);
+    const float scale_B = __ldg(d_scale_B);
+    const float scale = a_scale_per_row ? 0.f : __ldg(d_scale_A) * scale_B;
 
     // sA/sB (K-loop) and c_smem (epilogue) are temporally disjoint — overlap them.
     // K-loop: 2×(128×48) + 2×(32×144) = 21504 B
@@ -203,10 +233,28 @@ __global__ void gemm_int8_wmma_kernel(
         stage = next_s;
     }
 
-    // Epilogue: INT32 → float → ×scale → [GELU] → FP16
+    // Epilogue: INT32 → float → ×scale → [GELU] → FP16 (+ absmax statistics)
     // sA/sB no longer needed — repurpose _smem as c_smem
     int32_t* c_smem = reinterpret_cast<int32_t*>(_smem);
     int32_t* c_base = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
+
+    // s_rowstat serves the two mutually-exclusive epilogue stat paths:
+    //   GEMM1 (d_row_absmax): per-row |C| max accumulator
+    //   GEMM2 (a_scale_per_row): cache of d_scale_A[row]*scale_B
+    __shared__ float s_rowstat[BLOCK_M];
+    __shared__ float s_outmax;
+    if (d_row_absmax != nullptr)
+        for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
+            s_rowstat[i] = 0.f;
+    if (a_scale_per_row)
+        for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
+            s_rowstat[i] = __ldg(&d_scale_A[block_m + i]) * scale_B;
+    if (d_out_absmax != nullptr && threadIdx.x == 0)
+        s_outmax = 0.f;
+    if (d_row_absmax != nullptr || d_out_absmax != nullptr || a_scale_per_row)
+        __syncthreads();
+
+    float tmax = 0.f;   // per-thread |C| max for the d_out_absmax path
 
     #pragma unroll
     for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
@@ -218,19 +266,128 @@ __global__ void gemm_int8_wmma_kernel(
 
         const int row_base = block_m + (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
         const int col_base = block_n + warp_ng * WARP_COL_TILES * WMMA_N;
+        const int blk_row_base = (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
+
+        // Lane i covers element rows lane/16 + 2j (j = 0..7) in every column
+        // tile, so per-row maxes accumulate in 8 registers across the ct loop.
+        float rmax8[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) rmax8[j] = 0.f;
 
         #pragma unroll
         for (int ct = 0; ct < WARP_COL_TILES; ct++) {
             int32_t* cp = c_base + ct * WMMA_M * WMMA_N;
             const int tile_col = col_base + ct * WMMA_N;
             #pragma unroll
-            for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
+            for (int j = 0; j < (WMMA_M * WMMA_N) / 32; j++) {
+                const int i = lane_id + j * 32;
                 const int r = i / WMMA_N, c = i % WMMA_N;
-                float v = (float)cp[i] * scale;
+                const float sa = a_scale_per_row
+                    ? s_rowstat[blk_row_base + r] : scale;
+                float v = (float)cp[i] * sa;
                 if (apply_gelu) v = int8_gelu(v);
                 C[(row_base + r) * N + (tile_col + c)] = __float2half_rn(v);
+                if (d_row_absmax != nullptr)
+                    rmax8[j] = fmaxf(rmax8[j], fabsf(v));
+                if (d_out_absmax != nullptr)
+                    tmax = fmaxf(tmax, fabsf(v));
             }
         }
+
+        if (d_row_absmax != nullptr) {
+            // Lanes 0-15 and 16-31 cover disjoint row sets; reduce within
+            // each 16-lane group so only 2 lanes per warp touch smem.
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float m = rmax8[j];
+                #pragma unroll
+                for (int off = 8; off >= 1; off >>= 1)
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+                if ((lane_id & 15) == 0) {
+                    const int r = lane_id / 16 + 2 * j;
+                    atomicMax(reinterpret_cast<int*>(&s_rowstat[blk_row_base + r]),
+                              __float_as_int(m));
+                }
+            }
+        }
+    }
+
+    if (d_out_absmax != nullptr) {
+        #pragma unroll
+        for (int off = 16; off >= 1; off >>= 1)
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+        if (lane_id == 0)
+            atomicMax(reinterpret_cast<int*>(&s_outmax), __float_as_int(tmax));
+    }
+    if (d_row_absmax != nullptr || d_out_absmax != nullptr) {
+        __syncthreads();
+        if (d_row_absmax != nullptr)
+            for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
+                atomic_max_pos_f32(&d_row_absmax[block_m + i], s_rowstat[i]);
+        if (d_out_absmax != nullptr && threadIdx.x == 0)
+            atomic_max_pos_f32(d_out_absmax, s_outmax);
+    }
+}
+
+// ── Dynamic-quant helper kernels ───────────────────────────────────────
+// Quantize the FP16 hidden matrix row-by-row using the absmax gathered in
+// the GEMM1 epilogue; also emits the per-row scales for GEMM2.
+__global__ void quantize_rows_kernel(
+    const half* __restrict__ H,         // (M, N) FP16
+    const float* __restrict__ row_absmax,
+    int8_t* __restrict__ out,           // (M, N) INT8
+    float* __restrict__ row_scales,     // (M,)
+    int M, int N
+) {
+    const size_t total_vec = (size_t)M * N / 8;
+    for (size_t v = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         v < total_vec; v += (size_t)gridDim.x * blockDim.x) {
+        const size_t base = v * 8;
+        const int row = (int)(base / N);
+        const float amax = fmaxf(__ldg(&row_absmax[row]), 1e-8f);
+        const float inv_scale = 127.f / amax;
+        if (base % N == 0) row_scales[row] = amax / 127.f;
+
+        const half2* h2 = reinterpret_cast<const half2*>(H + base);
+        char pack[8];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float2 f = __half22float2(h2[i]);
+            pack[2*i]   = (char)f32_to_i8(f.x, inv_scale);
+            pack[2*i+1] = (char)f32_to_i8(f.y, inv_scale);
+        }
+        *reinterpret_cast<uint2*>(out + base) =
+            *reinterpret_cast<const uint2*>(pack);
+    }
+}
+
+// Quantize the FP16 output with the dynamic per-tensor absmax from the
+// GEMM2 epilogue; publishes the final output scale for the host.
+__global__ void quantize_tensor_kernel(
+    const half* __restrict__ in,
+    const float* __restrict__ d_absmax,
+    int8_t* __restrict__ out,
+    float* __restrict__ d_scale_out,
+    size_t n
+) {
+    const float amax = fmaxf(__ldg(d_absmax), 1e-8f);
+    const float inv_scale = 127.f / amax;
+    if (blockIdx.x == 0 && threadIdx.x == 0) *d_scale_out = amax / 127.f;
+
+    const size_t total_vec = n / 8;
+    for (size_t v = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         v < total_vec; v += (size_t)gridDim.x * blockDim.x) {
+        const size_t base = v * 8;
+        const half2* h2 = reinterpret_cast<const half2*>(in + base);
+        char pack[8];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float2 f = __half22float2(h2[i]);
+            pack[2*i]   = (char)f32_to_i8(f.x, inv_scale);
+            pack[2*i+1] = (char)f32_to_i8(f.y, inv_scale);
+        }
+        *reinterpret_cast<uint2*>(out + base) =
+            *reinterpret_cast<const uint2*>(pack);
     }
 }
 
@@ -412,6 +569,17 @@ static float*  s_scale_out        = nullptr;
 static float*  s_inv_scale_out    = nullptr;
 static size_t  s_hidden_cap       = 0;
 
+#if INT8_MLP_DYNAMIC
+static half*   s_hidden_f16  = nullptr;   // FP16 hidden (pre-quantization)
+static half*   s_out_f16     = nullptr;   // FP16 output (pre-quantization)
+static float*  s_row_absmax  = nullptr;   // per-token |hidden| max
+static float*  s_row_scales  = nullptr;   // per-token hidden scales
+static float*  s_out_absmax  = nullptr;   // global |out| max
+static size_t  s_h16_cap     = 0;
+static size_t  s_o16_cap     = 0;
+static size_t  s_rows_cap    = 0;
+#endif
+
 // ── Public interface ───────────────────────────────────────────────────
 // Uses static per-tensor scales (scale_x * scale_W1 * d_model for hidden,
 // extended by scale_W2 * d_ff for output) to avoid dynamic reduce passes.
@@ -437,17 +605,70 @@ void int8_mlp_forward(
         s_hidden_cap = hidden_i8_sz;
     }
 
+    const bool use_wmma =
+        (T      % BLOCK_M == 0) && (d_model % BLOCK_N == 0) &&
+        (d_ff   % BLOCK_N == 0) && (d_model % STAGE_K == 0) &&
+        (d_ff   % STAGE_K == 0);
+
+#if INT8_MLP_DYNAMIC
+    // ── Dynamic quantization path ───────────────────────────────────────
+    // GEMM1 → FP16 hidden + per-row absmax → per-token INT8 requant →
+    // GEMM2 (per-row A scales) → FP16 out + global absmax → INT8 out.
+    if (use_wmma) {
+        const size_t h16_sz  = (size_t)T * d_ff * sizeof(half);
+        const size_t o16_sz  = (size_t)T * d_model * sizeof(half);
+        const size_t rows_sz = (size_t)T * sizeof(float);
+        if (h16_sz > s_h16_cap) {
+            cudaFree(s_hidden_f16);
+            cudaMalloc(&s_hidden_f16, h16_sz);
+            s_h16_cap = h16_sz;
+        }
+        if (o16_sz > s_o16_cap) {
+            cudaFree(s_out_f16);
+            cudaMalloc(&s_out_f16, o16_sz);
+            s_o16_cap = o16_sz;
+        }
+        if (rows_sz > s_rows_cap) {
+            cudaFree(s_row_absmax);  cudaFree(s_row_scales);
+            cudaMalloc(&s_row_absmax, rows_sz);
+            cudaMalloc(&s_row_scales, rows_sz);
+            if (!s_out_absmax) cudaMalloc(&s_out_absmax, sizeof(float));
+            s_rows_cap = rows_sz;
+        }
+        cudaMemsetAsync(s_row_absmax, 0, rows_sz);
+        cudaMemsetAsync(s_out_absmax, 0, sizeof(float));
+
+        dim3 grid1(d_ff / BLOCK_N, T / BLOCK_M);
+        gemm_int8_wmma_f16_kernel<true, false><<<grid1, THREADS_PER_BLOCK>>>(
+            x, W1, s_hidden_f16, T, d_ff, d_model,
+            scale_x, scale_W1, s_row_absmax, nullptr);
+
+        const size_t h_vecs = (size_t)T * d_ff / 8;
+        const int qb1 = (int)((h_vecs + 255) / 256 < 4096
+                              ? (h_vecs + 255) / 256 : 4096);
+        quantize_rows_kernel<<<qb1, 256>>>(
+            s_hidden_f16, s_row_absmax, s_hidden_int8, s_row_scales, T, d_ff);
+
+        dim3 grid2(d_model / BLOCK_N, T / BLOCK_M);
+        gemm_int8_wmma_f16_kernel<false, true><<<grid2, THREADS_PER_BLOCK>>>(
+            s_hidden_int8, W2, s_out_f16, T, d_model, d_ff,
+            s_row_scales, scale_W2, nullptr, s_out_absmax);
+
+        const size_t o_elems = (size_t)T * d_model;
+        const int qb2 = (int)((o_elems / 8 + 255) / 256 < 4096
+                              ? (o_elems / 8 + 255) / 256 : 4096);
+        quantize_tensor_kernel<<<qb2, 256>>>(
+            s_out_f16, s_out_absmax, out, s_scale_out, o_elems);
+        return;
+    }
+#endif  // INT8_MLP_DYNAMIC
+
     // Compute static scales on device — no cudaMemcpy, no extra kernel passes.
     compute_static_scales_kernel<<<1, 1>>>(
         scale_x, scale_W1, scale_W2,
         s_scale_hidden, s_inv_scale_hidden,
         s_scale_out,    s_inv_scale_out,
         d_model, d_ff);
-
-    const bool use_wmma =
-        (T      % BLOCK_M == 0) && (d_model % BLOCK_N == 0) &&
-        (d_ff   % BLOCK_N == 0) && (d_model % STAGE_K == 0) &&
-        (d_ff   % STAGE_K == 0);
 
     // ── GEMM 1: x @ W1 → INT8 hidden (with GELU, static scale) ─────────
     if (use_wmma) {
