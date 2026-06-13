@@ -45,6 +45,7 @@ from baseline import attention_baseline, mlp_baseline, check_cuda
 
 DATA_DIR = os.path.join("testdata", "validate")
 REAL_CORPUS = os.path.join("testdata", "real_corpus.txt")  # WikiText-2 test split
+BLOCK_M = 128  # int8_mlp WMMA tile: the token count is padded up to a multiple of this
 EDGE_DATASETS = ("short_seq", "long_seq", "zeros", "constant")
 ERR_ATOL = 0.1          # |err| above this counts toward the outlier ratio
 STAGE_RANGE_MAX = 1.5   # gate-2 absmax ratio ceiling
@@ -325,49 +326,66 @@ def gate4(ref, act, thr):
     return fails
 
 
-def _kernel_faithful_mlp(x, w1, b1, w2, b2):
-    """One MLP layer under the INT8 kernel's exact quantization scheme, with
-    GPT-2's biases inserted where the real model applies them.
+def _kernel_real_mlp_fwd(ext, w1, b1, w2, b2):
+    """Return forward(hidden)->out that runs the REAL int8_mlp CUDA kernel.
 
-    Mirrors int8_mlp.cu's default (dynamic, per-channel/per-token) path:
-      per-token activation scale, per-channel weight scales, integer matmul,
-      dequant, +b1, tanh-GELU, per-token hidden requant, GEMM2, dequant,
-      per-token output requant.  b2 is added in FP16 after dequant (the kernel
-      emits the matmul only; bias lives outside it, as in deployment).
-    The kernel CANNOT host the pre-GELU bias inside its fused epilogue, so the
-    task-level gate uses this faithful simulation; gates 1-4 separately confirm
-    the real kernel matches this scheme within SIM_KERNEL_ATOL.
+    Static-weight inference: W1/W2 are per-output-channel INT8-quantized ONCE
+    here; the activation is per-token quantized on every call. b1 (GPT-2 c_fc
+    bias) is added IN-KERNEL before the fused GELU; b2 (c_proj bias) is added in
+    FP after dequant — the exact granularity and scope the deployed kernel uses.
+    This makes Gate 5 the perplexity of the shipped CUDA code itself, not a
+    PyTorch model of it (closing the sim-vs-real gap). Gates 1-4 separately
+    confirm the kernel matches its reference scheme within SIM_KERNEL_ATOL.
+
+      x  : per-token INT8 activation quant
+      W1 : c_fc.weight  [d_model, d_ff],  per-channel INT8
+      W2 : c_proj.weight [d_ff, d_model], per-channel INT8
+      out: per-token INT8 output; dequant in FP, then + b2 (FP16)
+    Token rows are zero-padded up to a multiple of BLOCK_M so the WMMA path is
+    taken (GPT-2's d_model=768 / d_ff=3072 already satisfy the other multiples).
     """
-    def gelu(z):
-        return 0.5 * z * (1.0 + torch.tanh(0.7978845608028654 *
-                                           (z + 0.044715 * z * z * z)))
-    sx = x.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 127.0       # per-token
-    xq = (x / sx).round().clamp(-128, 127)
-    s1 = w1.abs().amax(0, keepdim=True).clamp(min=1e-8) / 127.0       # per-channel
-    w1q = (w1 / s1).round().clamp(-128, 127)
-    g1 = (xq @ w1q) * (sx * s1) + b1
-    h = gelu(g1)
-    sh = h.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 127.0       # per-token
-    hq = (h / sh).round().clamp(-128, 127)
-    s2 = w2.abs().amax(0, keepdim=True).clamp(min=1e-8) / 127.0       # per-channel
-    w2q = (w2 / s2).round().clamp(-128, 127)
-    g2 = (hq @ w2q) * (sh * s2)
-    so = g2.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 127.0      # per-token out
-    g2 = (g2 / so).round().clamp(-128, 127) * so
-    return g2 + b2
+    d_model, d_ff = w1.shape
+    sw1 = w1.abs().amax(0, keepdim=True).clamp(min=1e-8) / 127.0      # per-channel
+    w1i = (w1 / sw1).round().clamp(-127, 127).to(torch.int8).contiguous()
+    sw2 = w2.abs().amax(0, keepdim=True).clamp(min=1e-8) / 127.0      # per-channel
+    w2i = (w2 / sw2).round().clamp(-127, 127).to(torch.int8).contiguous()
+    s1 = sw1.squeeze(0).float().contiguous()
+    s2 = sw2.squeeze(0).float().contiguous()
+    b1 = b1.float().contiguous()
+    b2f = b2.float()
+
+    def fwd(hidden):
+        shp = hidden.shape
+        x = hidden.reshape(-1, shp[-1]).float()                      # [N, d_model]
+        n = x.shape[0]
+        npad = (n + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+        if npad != n:
+            x = F.pad(x, (0, 0, 0, npad - n))                        # zero-pad rows
+        sx = x.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 127.0  # per-token
+        xi = (x / sx).round().clamp(-127, 127).to(torch.int8)
+        out_i8, out_s = ext.int8_mlp_forward_per_channel_bias(
+            xi.reshape(1, npad, d_model).contiguous(),
+            w1i, w2i,
+            sx.squeeze(-1).float().contiguous(), s1, s2, b1)
+        out = out_i8.float().reshape(npad, d_model) * out_s.reshape(npad, 1)
+        out = out[:n] + b2f                                          # b2 FP, drop pad
+        return out.reshape(shp).to(hidden.dtype)
+
+    return fwd
 
 
 def gate5(ext, n_ctx=3072, stride=512, model_name="gpt2"):
-    """Task-level: real GPT-2 perplexity on WikiText-2 with the INT8 MLP scheme.
+    """Task-level: real GPT-2 perplexity on WikiText-2 with the INT8 MLP kernel.
 
-    Every transformer block's MLP is replaced by the kernel-faithful INT8
-    simulation above; LayerNorm, attention, and residuals stay FP16 (the
+    Every transformer block's MLP is replaced by the REAL int8_mlp CUDA kernel
+    (`_kernel_real_mlp_fwd`); LayerNorm, attention, and residuals stay FP16 (the
     attention kernel has no causal mask, so real causal attention cannot use
     it). Perplexity is measured on held-out text against the unmodified FP16
     model — the deployment-faithful accuracy signal. The previous gate used a
     random LM head and self-consistency labels, which reported +0.01% where the
     real per-tensor degradation is ~+15%; per-channel weights bring it back
-    under the 2% bar (see iteration log).
+    under the 2% bar (see iteration log). This gate now runs the shipped kernel
+    itself, not a PyTorch simulation of it.
 
     Returns (metrics, fails), or (None, [reason]) when transformers/the corpus
     are unavailable — the gate is then skipped (not failed).
@@ -402,20 +420,14 @@ def gate5(ext, n_ctx=3072, stride=512, model_name="gpt2"):
     model = GPT2LMHeadModel.from_pretrained(model_name).eval().cuda()
     ppl_fp16, ntok = perplexity(model)
 
-    def make_fwd(w1, b1, w2, b2):
-        def fwd(hidden):
-            shp = hidden.shape
-            out = _kernel_faithful_mlp(hidden.reshape(-1, shp[-1]).float(),
-                                       w1, b1, w2, b2)
-            return out.reshape(shp).to(hidden.dtype)
-        return fwd
-
     for blk in model.transformer.h:
         m = blk.mlp
-        blk.mlp.forward = make_fwd(m.c_fc.weight.data.float().cuda(),
-                                   m.c_fc.bias.data.float().cuda(),
-                                   m.c_proj.weight.data.float().cuda(),
-                                   m.c_proj.bias.data.float().cuda())
+        blk.mlp.forward = _kernel_real_mlp_fwd(
+            ext,
+            m.c_fc.weight.data.float().cuda(),
+            m.c_fc.bias.data.float().cuda(),
+            m.c_proj.weight.data.float().cuda(),
+            m.c_proj.bias.data.float().cuda())
     ppl_i8, _ = perplexity(model)
     ppl_inc = ppl_i8 / ppl_fp16 - 1.0
 

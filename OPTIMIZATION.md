@@ -265,3 +265,32 @@ the structure that later let the occupancy analysis conclude the well is dry.
   decode is competitive-to-ahead of the production FP8 SOTA at equal KV bandwidth
   and more accurate — the win is real kernel quality, not "INT8 vs unquantized".
   On Ampere, INT8 is the *right* quantized format. Next kernel target: D=128 decode.
+
+### Iteration 19 — harden Gate 5: run the SHIPPED kernel, not a simulation
+- **Change**: Gate 5 (task-level real-GPT-2 perplexity) previously measured a
+  PyTorch *simulation* of the kernel's quantization (`_kernel_faithful_mlp`).
+  This iteration makes it run the **actual CUDA kernel** end-to-end inside a real
+  GPT-2 forward, closing the sim-vs-real gap.
+- **Two parts**:
+  1. New entry point `int8_mlp_forward_per_channel_bias` (`int8_mlp.cu` +
+     binding): the per-channel/per-token path plus an optional **per-channel
+     pre-GELU bias** (GPT-2 `c_fc` bias) added inside the GEMM1 fused epilogue
+     before GELU. `apply_bias` is an OFF-by-default template flag → every
+     existing instantiation is byte-identical and the graded path is unchanged.
+     `b2` (`c_proj` bias) stays FP16 at the caller after dequant.
+  2. `validate_int8.py` Gate 5 now patches each block's MLP with
+     `_kernel_real_mlp_fwd` (weights per-channel-quantized once, activation
+     per-token per call, token rows zero-padded up to BLOCK_M=128 for the WMMA
+     path), calling the real kernel. The standalone driver `gate5_real_kernel.py`
+     shares the exact same forward (single source of truth) for ad-hoc
+     model/context runs.
+- **Why it matters**: the old gate could pass while the real kernel regressed —
+  a model of the code is not the code. Gates 1–4 already check the kernel against
+  its reference; Gate 5 now also exercises it at task level.
+- **Result**: all 5 gates PASS. Real GPT-2 perplexity (WikiText-2, n_ctx=3072):
+  FP16 **31.9462** → INT8 kernel **31.9890** = **+0.134%**, well under the 2%
+  bar. The integrated gate reproduces the standalone driver's number exactly,
+  confirming the wiring. (Naive per-tensor *output* quant would be +64%; the
+  per-token output quant is what recovers it — do not revert.)
+- **Note**: this is an accuracy/validation-integrity change, not a perf change;
+  no inner loop or graded shape was touched.

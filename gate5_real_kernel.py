@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Real GPT-2 perplexity on WikiText-2 with the ACTUAL INT8 MLP CUDA kernel.
 
-This closes the sim-vs-real gap in validate_int8.py's Gate 5. Gate 5 measures
-perplexity with `_kernel_faithful_mlp` — a PyTorch *simulation* of the kernel's
-quantization. This script instead patches every GPT-2 block's MLP to call the
-real kernel `ext.int8_mlp_forward_per_channel_bias`, so the reported perplexity
-is produced by the exact CUDA code that ships, not a model of it.
+Standalone driver for ad-hoc runs (e.g. gpt2-medium, custom n_ctx). It shares
+the exact MLP forward used by validate_int8.py's Gate 5 (`_kernel_real_mlp_fwd`),
+which patches every GPT-2 block's MLP to call the real kernel
+`ext.int8_mlp_forward_per_channel_bias` — so the reported perplexity is produced
+by the exact CUDA code that ships, not a model of it. Gate 5 in validate_int8.py
+now runs this same path; use this script when you want a different model/context
+than the gate's fixed gpt2 / n_ctx=3072.
 
 Wiring (matches the kernel + GPT-2 layout):
   - x  : per-token (per-row) INT8 activation quant
@@ -31,8 +33,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 
+from validate_int8 import _kernel_real_mlp_fwd
+
 REAL_CORPUS = "testdata/real_corpus.txt"
-BLOCK_M = 128  # kernel tile: T must be a multiple of this for the WMMA path
 
 
 def build_ext():
@@ -47,55 +50,6 @@ def build_ext():
         ],
         extra_cuda_cflags=["-arch=sm_80", "--std=c++17", "-O3"],
     )
-
-
-def q_per_token(t):
-    """Per-row (per-token) symmetric INT8 quant of [N, K]. Returns (int8, scale[N])."""
-    s = t.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 127.0
-    q = (t / s).round().clamp(-127, 127).to(torch.int8)
-    return q, s.squeeze(-1)
-
-
-def q_per_channel(w):
-    """Per-output-column symmetric INT8 quant of [K, N]. Returns (int8, scale[N])."""
-    s = w.abs().amax(0, keepdim=True).clamp(min=1e-8) / 127.0
-    q = (w / s).round().clamp(-127, 127).to(torch.int8)
-    return q, s.squeeze(0)
-
-
-def make_kernel_mlp(ext, w1, b1, w2, b2):
-    """Return a forward(hidden)->out that runs the real INT8 MLP kernel.
-
-    Weights are quantized ONCE here (static-weight inference); only the
-    activation is quantized per call. b1 goes in-kernel (pre-GELU), b2 in FP16.
-    """
-    d_model, d_ff = w1.shape
-    w1i, s1 = q_per_channel(w1)            # [d_model, d_ff] -> col scale [d_ff]
-    w2i, s2 = q_per_channel(w2)            # [d_ff, d_model] -> col scale [d_model]
-    w1i = w1i.contiguous()
-    w2i = w2i.contiguous()
-    s1 = s1.float().contiguous()
-    s2 = s2.float().contiguous()
-    b1 = b1.float().contiguous()
-    b2f = b2.float()
-
-    def fwd(hidden):
-        shp = hidden.shape
-        x = hidden.reshape(-1, shp[-1]).float()       # [N, d_model]
-        n = x.shape[0]
-        npad = (n + BLOCK_M - 1) // BLOCK_M * BLOCK_M  # round up to tile
-        if npad != n:
-            x = F.pad(x, (0, 0, 0, npad - n))         # zero-pad the token rows
-        xi, sx = q_per_token(x)                        # [npad, d_model]
-        out_i8, out_s = ext.int8_mlp_forward_per_channel_bias(
-            xi.reshape(1, npad, d_model).contiguous(),
-            w1i, w2i,
-            sx.float().contiguous(), s1, s2, b1)
-        out = out_i8.float().reshape(npad, d_model) * out_s.reshape(npad, 1)
-        out = out[:n] + b2f                            # b2 in FP, drop pad rows
-        return out.reshape(shp).to(hidden.dtype)
-
-    return fwd
 
 
 def perplexity(model, ids, stride):
@@ -138,7 +92,7 @@ def main():
 
     for blk in model.transformer.h:
         m = blk.mlp
-        blk.mlp.forward = make_kernel_mlp(
+        blk.mlp.forward = _kernel_real_mlp_fwd(
             ext,
             m.c_fc.weight.data.float().cuda(),     # [d_model, d_ff]
             m.c_fc.bias.data.float().cuda(),       # [d_ff]
