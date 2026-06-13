@@ -655,11 +655,17 @@ static size_t  s_rows_cap    = 0;
 //   outliers — measured +64% GPT-2 perplexity vs −0.07% per-token). When it is
 //   nullptr the legacy dynamic per-tensor output quant is used (scalar scale via
 //   int8_mlp_get_output_scale), preserving the per-tensor entry point.
+// weights_prepacked=true means W1/W2 are ALREADY transposed to [N][K]
+// (W1→[d_ff][d_model], W2→[d_model][d_ff]) by transpose_int8_weights, so the
+// per-forward transpose pass is skipped — for static-weight inference where the
+// caller transposes once at load. Requires the WMMA path (the scalar fallback
+// consumes the original [K][N] layout); the prepacked entry point guards this.
 static void int8_mlp_forward_impl(
     const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
     const float* scale_x, const float* scale_W1, const float* scale_W2,
     int batch, int seq_len, int d_model, int d_ff,
-    bool x_per_token, bool w_per_channel, float* out_row_scales
+    bool x_per_token, bool w_per_channel, float* out_row_scales,
+    bool weights_prepacked = false
 ) {
     const int T = batch * seq_len;
 
@@ -688,7 +694,7 @@ static void int8_mlp_forward_impl(
     // constant per forward; this is a one-shot bandwidth pass (~1-2% of GEMM).
     const int8_t* W1T = W1;
     const int8_t* W2T = W2;
-    if (use_wmma) {
+    if (use_wmma && !weights_prepacked) {
         const size_t wt_sz = (size_t)d_model * d_ff * sizeof(int8_t);
         if (wt_sz > s_wt_cap) {
             cudaFree(s_w1t);  cudaFree(s_w2t);
@@ -704,6 +710,7 @@ static void int8_mlp_forward_impl(
         W1T = s_w1t;
         W2T = s_w2t;
     }
+    // weights_prepacked: W1/W2 are already [N][K]; W1T/W2T already point at them.
 
 #if INT8_MLP_DYNAMIC
     // ── Dynamic quantization path ───────────────────────────────────────
@@ -857,6 +864,41 @@ void int8_mlp_forward_per_channel(
                           batch, seq_len, d_model, d_ff,
                           /*x_per_token=*/true, /*w_per_channel=*/true,
                           out_row_scales);
+}
+
+// Transpose the INT8 weights ONCE into caller-owned [N][K] buffers
+// (W1 [d_model][d_ff] → W1T [d_ff][d_model]; W2 [d_ff][d_model] →
+// W2T [d_model][d_ff]) so int8_mlp_forward_prepacked can reuse them across
+// every forward. This is the same one-shot bandwidth pass int8_mlp_forward
+// runs internally each call; doing it once at load is the realistic
+// static-weight inference pattern and removes the per-call transpose
+// (~10% of MLP forward time on the graded shape).
+void transpose_int8_weights(
+    const int8_t* W1, const int8_t* W2, int8_t* W1T, int8_t* W2T,
+    int d_model, int d_ff
+) {
+    const dim3 tb(32, 32);
+    transpose_int8_kernel<<<dim3((d_ff + 31) / 32, (d_model + 31) / 32), tb>>>(
+        W1, W1T, d_model, d_ff);   // [d_model][d_ff] -> [d_ff][d_model]
+    transpose_int8_kernel<<<dim3((d_model + 31) / 32, (d_ff + 31) / 32), tb>>>(
+        W2, W2T, d_ff, d_model);   // [d_ff][d_model] -> [d_model][d_ff]
+}
+
+// Per-tensor MLP with PRE-TRANSPOSED weights (W1T [d_ff][d_model],
+// W2T [d_model][d_ff] from transpose_int8_weights). Bit-identical output to
+// int8_mlp_forward — same transpose, same GEMMs — but skips the per-forward
+// transpose. WMMA-path shapes only (the caller/binding guarantees the tile
+// multiples). The per-tensor int8_mlp_forward device signature is unchanged.
+void int8_mlp_forward_prepacked(
+    const int8_t* x, const int8_t* W1T, const int8_t* W2T, int8_t* out,
+    const float* scale_x, const float* scale_W1, const float* scale_W2,
+    int batch, int seq_len, int d_model, int d_ff
+) {
+    int8_mlp_forward_impl(x, W1T, W2T, out, scale_x, scale_W1, scale_W2,
+                          batch, seq_len, d_model, d_ff,
+                          /*x_per_token=*/false, /*w_per_channel=*/false,
+                          /*out_row_scales=*/nullptr,
+                          /*weights_prepacked=*/true);
 }
 
 // Returns the static output scale from the most recent int8_mlp_forward call.

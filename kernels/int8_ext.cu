@@ -43,6 +43,17 @@ void int8_mlp_forward_per_channel(
     int batch, int seq_len, int d_model, int d_ff
 );
 
+void transpose_int8_weights(
+    const int8_t* W1, const int8_t* W2, int8_t* W1T, int8_t* W2T,
+    int d_model, int d_ff
+);
+
+void int8_mlp_forward_prepacked(
+    const int8_t* x, const int8_t* W1T, const int8_t* W2T, int8_t* out,
+    const float* scale_x, const float* scale_W1, const float* scale_W2,
+    int batch, int seq_len, int d_model, int d_ff
+);
+
 void int8_mlp_get_output_scale(float* host_out);
 
 // ── Helper: pack Python float scalars into a 1-D CUDA float tensor ─────
@@ -226,6 +237,96 @@ std::tuple<torch::Tensor, torch::Tensor> int8_mlp_forward_pc_torch(
     return {out, out_scale};
 }
 
+// ── Weight pre-transpose (static-weight inference) ────────────────────
+// W1 : (d_model, d_ff)  int8  →  W1T : (d_ff, d_model)
+// W2 : (d_ff, d_model)  int8  →  W2T : (d_model, d_ff)
+// Run ONCE at load; feed the results to int8_mlp_forward_prepacked on every
+// forward to skip the per-call transpose. Returns (W1T, W2T).
+std::tuple<torch::Tensor, torch::Tensor> transpose_int8_weights_torch(
+    torch::Tensor W1,
+    torch::Tensor W2
+) {
+    TORCH_CHECK(W1.device().is_cuda(),       "W1 must be a CUDA tensor");
+    TORCH_CHECK(W1.dtype() == torch::kInt8,  "W1 must be int8");
+    TORCH_CHECK(W2.dtype() == torch::kInt8,  "W2 must be int8");
+    TORCH_CHECK(W1.is_contiguous(),          "W1 must be contiguous");
+    TORCH_CHECK(W2.is_contiguous(),          "W2 must be contiguous");
+    TORCH_CHECK(W1.dim() == 2, "W1 must be 2-D (d_model, d_ff)");
+    TORCH_CHECK(W2.dim() == 2, "W2 must be 2-D (d_ff, d_model)");
+
+    const int d_model = W1.size(0);
+    const int d_ff    = W1.size(1);
+    TORCH_CHECK(W2.size(0) == d_ff,    "W2 shape mismatch (expected d_ff rows)");
+    TORCH_CHECK(W2.size(1) == d_model, "W2 shape mismatch (expected d_model cols)");
+
+    auto opts = torch::TensorOptions().dtype(torch::kInt8).device(W1.device());
+    auto W1T = torch::empty({d_ff, d_model}, opts);
+    auto W2T = torch::empty({d_model, d_ff}, opts);
+
+    transpose_int8_weights(
+        W1.data_ptr<int8_t>(), W2.data_ptr<int8_t>(),
+        W1T.data_ptr<int8_t>(), W2T.data_ptr<int8_t>(),
+        d_model, d_ff);
+
+    return {W1T, W2T};
+}
+
+// ── INT8 MLP binding (per-tensor, PRE-TRANSPOSED weights) ─────────────
+// x   : (batch, seq_len, d_model)  int8
+// W1T : (d_ff, d_model)             int8   (from transpose_int8_weights)
+// W2T : (d_model, d_ff)            int8
+// Same result as int8_mlp_forward; skips the per-forward weight transpose.
+// Requires WMMA-path tile multiples (T, d_model, d_ff each a multiple of 128).
+std::tuple<torch::Tensor, double> int8_mlp_forward_prepacked_torch(
+    torch::Tensor x,
+    torch::Tensor W1T,
+    torch::Tensor W2T,
+    double scale_x,
+    double scale_W1,
+    double scale_W2
+) {
+    TORCH_CHECK(x.device().is_cuda(),           "x must be a CUDA tensor");
+    TORCH_CHECK(x.dtype()   == torch::kInt8,    "x must be int8");
+    TORCH_CHECK(W1T.dtype() == torch::kInt8,    "W1T must be int8");
+    TORCH_CHECK(W2T.dtype() == torch::kInt8,    "W2T must be int8");
+    TORCH_CHECK(x.is_contiguous(),              "x must be contiguous");
+    TORCH_CHECK(W1T.is_contiguous(),            "W1T must be contiguous");
+    TORCH_CHECK(W2T.is_contiguous(),            "W2T must be contiguous");
+    TORCH_CHECK(x.dim()   == 3, "x must be 3-D (batch, seq_len, d_model)");
+    TORCH_CHECK(W1T.dim() == 2, "W1T must be 2-D (d_ff, d_model)");
+    TORCH_CHECK(W2T.dim() == 2, "W2T must be 2-D (d_model, d_ff)");
+
+    const int batch   = x.size(0);
+    const int seq_len = x.size(1);
+    const int d_model = x.size(2);
+    const int d_ff    = W1T.size(0);
+    const int T       = batch * seq_len;
+
+    TORCH_CHECK(W1T.size(1) == d_model, "W1T shape mismatch (expected d_model cols)");
+    TORCH_CHECK(W2T.size(0) == d_model, "W2T shape mismatch (expected d_model rows)");
+    TORCH_CHECK(W2T.size(1) == d_ff,    "W2T shape mismatch (expected d_ff cols)");
+    TORCH_CHECK(T % 128 == 0 && d_model % 128 == 0 && d_ff % 128 == 0,
+                "prepacked path requires the WMMA tile multiples "
+                "(batch*seq_len, d_model, d_ff each a multiple of 128)");
+
+    auto out = torch::empty_like(x);
+
+    auto d_sx  = make_scale_tensor(scale_x,  x.device());
+    auto d_sw1 = make_scale_tensor(scale_W1, x.device());
+    auto d_sw2 = make_scale_tensor(scale_W2, x.device());
+
+    int8_mlp_forward_prepacked(
+        x.data_ptr<int8_t>(), W1T.data_ptr<int8_t>(), W2T.data_ptr<int8_t>(),
+        out.data_ptr<int8_t>(),
+        d_sx.data_ptr<float>(), d_sw1.data_ptr<float>(), d_sw2.data_ptr<float>(),
+        batch, seq_len, d_model, d_ff);
+
+    float out_scale;
+    int8_mlp_get_output_scale(&out_scale);
+
+    return {out, (double)out_scale};
+}
+
 // ── Module registration ────────────────────────────────────────────────
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("int8_attention_forward", &int8_attention_forward_torch,
@@ -236,4 +337,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "INT8 MLP, per-tensor scales (CUDA) — returns (int8_out, out_scale)");
     m.def("int8_mlp_forward", &int8_mlp_forward_pc_torch,
           "INT8 MLP, per-token/per-channel scales (CUDA) — returns (int8_out, out_scale)");
+    // Static-weight inference: transpose weights once, then call prepacked.
+    m.def("transpose_int8_weights", &transpose_int8_weights_torch,
+          "Pre-transpose INT8 W1/W2 to [N][K] for the prepacked MLP path — "
+          "returns (W1T, W2T)");
+    m.def("int8_mlp_forward_prepacked", &int8_mlp_forward_prepacked_torch,
+          "INT8 MLP, per-tensor scales, PRE-TRANSPOSED weights (CUDA) — "
+          "returns (int8_out, out_scale)");
 }
