@@ -4,9 +4,9 @@ __pycache__/
 *.o
 *.so
 
-# Generated locally — regenerate with the commands in README.md, never committed
+# Generated locally — regenerate with the commands in README.md
 testdata/
-results/
+# results/ IS committed (benchmark CSVs + figures) as the published data snapshot.
 
 # Compiled CUDA smoke-test binary
 test_int8

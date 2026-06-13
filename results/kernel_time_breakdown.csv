@@ -1,0 +1,11 @@
+forward,category,self_us_total,pct
+int8_mlp,GEMM1/GEMM2 (INT8 WMMA),24605.21000000001,78.99559301137195
+int8_mlp,transpose W (B k-contig),3242.766000000005,10.410974877561088
+int8_mlp,quantize_rows (per-token),2294.497000000023,7.36653542797707
+int8_mlp,other / elementwise,579.5359999999746,1.8606136664322894
+int8_mlp,quantize_tensor,425.56400000002577,1.3662830166575908
+int8_mlp_prepacked,GEMM1/GEMM2 (INT8 WMMA),24597.596999999994,88.35637636510471
+int8_mlp_prepacked,quantize_rows (per-token),2221.564000000008,7.980021174554907
+int8_mlp_prepacked,other / elementwise,591.1229999999873,2.123357263966423
+int8_mlp_prepacked,quantize_tensor,428.7899999999904,1.5402451963739552
+int8_attn,attention (INT8 WMMA),3209.298999999997,100.0
