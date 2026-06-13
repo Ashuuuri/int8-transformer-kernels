@@ -264,8 +264,13 @@ __device__ __forceinline__ void mlp_int8_mainloop(
 
 // ── INT8 WMMA GEMM → FP16 output (dynamic-quant building block) ────────
 // C (FP16) = dequant( A (INT8) × B (INT8) )   [+ GELU]
-//   a_scale_per_row=false: real[i,j] = acc[i,j] * scale_A[0]   * scale_B[0]
-//   a_scale_per_row=true:  real[i,j] = acc[i,j] * scale_A[row] * scale_B[0]
+//   real[i,j] = acc[i,j] * sA(i) * sB(j), where
+//     sA(i) = a_scale_per_row ? scale_A[row] : scale_A[0]   (per-token activ.)
+//     sB(j) = b_scale_per_col ? scale_B[col] : scale_B[0]   (per-channel weight)
+// Per-row A and per-col B scale tables are staged once into smem (s_arow /
+// s_bcol) so the epilogue indexes them conflict-free; s_rowstat is then used
+// solely as the GEMM1 per-row absmax accumulator (no longer doubles as a
+// scale cache, so GEMM1 can be per-row AND gather absmax at once).
 // Optional epilogue statistics for dynamic quantization:
 //   d_row_absmax[M]: per-row absmax of C, accumulated via atomicMax
 //                    (GEMM1 → per-token hidden scales)
@@ -274,7 +279,7 @@ __device__ __forceinline__ void mlp_int8_mainloop(
 // launch_bounds caps registers at 128 (= 2 blocks/SM with 256 threads);
 // without it the epilogue statistics push the kernel to 166 regs, which
 // halves occupancy and costs ~35% end-to-end.
-template <bool apply_gelu, bool a_scale_per_row>
+template <bool apply_gelu, bool a_scale_per_row, bool b_scale_per_col>
 __global__ __launch_bounds__(THREADS_PER_BLOCK, 2)
 void gemm_int8_wmma_f16_kernel(
     const int8_t* __restrict__ A,
@@ -286,8 +291,9 @@ void gemm_int8_wmma_f16_kernel(
     float* __restrict__ d_row_absmax,
     float* __restrict__ d_out_absmax
 ) {
-    const float scale_B = __ldg(d_scale_B);
-    const float scale = a_scale_per_row ? 0.f : __ldg(d_scale_A) * scale_B;
+    // Scalar fallbacks (used only when the matching per-row/per-col flag is off).
+    const float scaleA0 = a_scale_per_row ? 0.f : __ldg(d_scale_A);
+    const float scaleB0 = b_scale_per_col ? 0.f : __ldg(d_scale_B);
 
     // sA/sB (K-loop) and c_smem (epilogue) are temporally disjoint — overlap them.
     // K-loop: 2×(128×48) A + 2×(128×48) B = 24576 B
@@ -321,20 +327,26 @@ void gemm_int8_wmma_f16_kernel(
     int32_t* c_smem = reinterpret_cast<int32_t*>(_smem);
     int32_t* c_base = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
 
-    // s_rowstat serves the two mutually-exclusive epilogue stat paths:
-    //   GEMM1 (d_row_absmax): per-row |C| max accumulator
-    //   GEMM2 (a_scale_per_row): cache of d_scale_A[row]*scale_B
+    // Per-row A scales (per-token activation) and per-col B scales (per-channel
+    // weight), staged once into smem so the epilogue indexes them conflict-free.
+    // s_rowstat is now ONLY the GEMM1 per-row |C| absmax accumulator.
+    __shared__ float s_arow[BLOCK_M];      // d_scale_A[block_m + i]
+    __shared__ float s_bcol[BLOCK_N];      // d_scale_B[block_n + i]
     __shared__ float s_rowstat[BLOCK_M];
     __shared__ float s_outmax;
+    if (a_scale_per_row)
+        for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
+            s_arow[i] = __ldg(&d_scale_A[block_m + i]);
+    if (b_scale_per_col)
+        for (int i = threadIdx.x; i < BLOCK_N; i += THREADS_PER_BLOCK)
+            s_bcol[i] = __ldg(&d_scale_B[block_n + i]);
     if (d_row_absmax != nullptr)
         for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
             s_rowstat[i] = 0.f;
-    if (a_scale_per_row)
-        for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
-            s_rowstat[i] = __ldg(&d_scale_A[block_m + i]) * scale_B;
     if (d_out_absmax != nullptr && threadIdx.x == 0)
         s_outmax = 0.f;
-    if (d_row_absmax != nullptr || d_out_absmax != nullptr || a_scale_per_row)
+    if (a_scale_per_row || b_scale_per_col ||
+        d_row_absmax != nullptr || d_out_absmax != nullptr)
         __syncthreads();
 
     float tmax = 0.f;   // per-thread |C| max for the d_out_absmax path
@@ -360,13 +372,16 @@ void gemm_int8_wmma_f16_kernel(
         for (int ct = 0; ct < WARP_COL_TILES; ct++) {
             int32_t* cp = c_base + ct * WMMA_M * WMMA_N;
             const int tile_col = col_base + ct * WMMA_N;
+            const int btile_col = (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
             #pragma unroll
             for (int j = 0; j < (WMMA_M * WMMA_N) / 32; j++) {
                 const int i = lane_id + j * 32;
                 const int r = i / WMMA_N, c = i % WMMA_N;
-                const float sa = a_scale_per_row
-                    ? s_rowstat[blk_row_base + r] : scale;
-                float v = (float)cp[i] * sa;
+                const float sa = a_scale_per_row ? s_arow[blk_row_base + r]
+                                                 : scaleA0;
+                const float sb = b_scale_per_col ? s_bcol[btile_col + c]
+                                                 : scaleB0;
+                float v = (float)cp[i] * sa * sb;
                 if (apply_gelu) v = int8_gelu(v);
                 C[(row_base + r) * N + (tile_col + c)] = __float2half_rn(v);
                 if (d_row_absmax != nullptr)
@@ -625,14 +640,26 @@ static size_t  s_o16_cap     = 0;
 static size_t  s_rows_cap    = 0;
 #endif
 
-// ── Public interface ───────────────────────────────────────────────────
-// Uses static per-tensor scales (scale_x * scale_W1 * d_model for hidden,
-// extended by scale_W2 * d_ff for output) to avoid dynamic reduce passes.
-// Both GEMM epilogues write INT8 directly — no intermediate quantize kernels.
-void int8_mlp_forward(
+// ── Forward implementation (per-tensor or per-channel quantization) ─────
+// x_per_token=false / w_per_channel=false  → the original per-tensor path
+//   (scale_x[0], scale_W1[0], scale_W2[0] scalars); this is what the public
+//   int8_mlp_forward and the tests/cuda/ .bin flow use.
+// x_per_token=true  → scale_x is a per-token vector [T] (GEMM1 A scale).
+// w_per_channel=true → scale_W1 [d_ff] and scale_W2 [d_model] are per-output-
+//   channel vectors (the LLM.int8()-style fix for emergent activation outliers
+//   — see README / iteration log). The hidden between GEMM1 and GEMM2 is
+//   always per-token (the existing dynamic behavior), independent of the flags.
+//   When out_row_scales != nullptr, the FP16 output is quantized PER-TOKEN
+//   (per-row absmax → per-row scale), writing the [T] scales there; this is
+//   what real models need (per-tensor output quant crushes MLP output channel
+//   outliers — measured +64% GPT-2 perplexity vs −0.07% per-token). When it is
+//   nullptr the legacy dynamic per-tensor output quant is used (scalar scale via
+//   int8_mlp_get_output_scale), preserving the per-tensor entry point.
+static void int8_mlp_forward_impl(
     const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
     const float* scale_x, const float* scale_W1, const float* scale_W2,
-    int batch, int seq_len, int d_model, int d_ff
+    int batch, int seq_len, int d_model, int d_ff,
+    bool x_per_token, bool w_per_channel, float* out_row_scales
 ) {
     const int T = batch * seq_len;
 
@@ -706,10 +733,20 @@ void int8_mlp_forward(
         cudaMemsetAsync(s_row_absmax, 0, rows_sz);
         cudaMemsetAsync(s_out_absmax, 0, sizeof(float));
 
+        // GEMM1: A=x, B=W1.  a_scale_per_row = x_per_token (scale_x is [T] or
+        // [1]); b_scale_per_col = w_per_channel (scale_W1 is [d_ff] or [1]).
+        // The template flags are compile-time, so dispatch on the two combos
+        // actually used (per-tensor: <true,false,false>; per-channel:
+        // <true,true,true>).
         dim3 grid1(d_ff / BLOCK_N, T / BLOCK_M);
-        gemm_int8_wmma_f16_kernel<true, false><<<grid1, THREADS_PER_BLOCK>>>(
-            x, W1T, s_hidden_f16, T, d_ff, d_model,
-            scale_x, scale_W1, s_row_absmax, nullptr);
+        if (x_per_token && w_per_channel)
+            gemm_int8_wmma_f16_kernel<true, true, true><<<grid1, THREADS_PER_BLOCK>>>(
+                x, W1T, s_hidden_f16, T, d_ff, d_model,
+                scale_x, scale_W1, s_row_absmax, nullptr);
+        else
+            gemm_int8_wmma_f16_kernel<true, false, false><<<grid1, THREADS_PER_BLOCK>>>(
+                x, W1T, s_hidden_f16, T, d_ff, d_model,
+                scale_x, scale_W1, s_row_absmax, nullptr);
 
         const size_t h_vecs = (size_t)T * d_ff / 8;
         const int qb1 = (int)((h_vecs + 255) / 256 < 4096
@@ -717,10 +754,35 @@ void int8_mlp_forward(
         quantize_rows_kernel<<<qb1, 256>>>(
             s_hidden_f16, s_row_absmax, s_hidden_int8, s_row_scales, T, d_ff);
 
+        // GEMM2: A=hidden (always per-token), B=W2.  b_scale_per_col =
+        // w_per_channel (scale_W2 is [d_model] or [1]).
         dim3 grid2(d_model / BLOCK_N, T / BLOCK_M);
-        gemm_int8_wmma_f16_kernel<false, true><<<grid2, THREADS_PER_BLOCK>>>(
-            s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
-            s_row_scales, scale_W2, nullptr, s_out_absmax);
+        if (out_row_scales) {
+            // Per-token output quant: GEMM2 gathers per-ROW output absmax (reuse
+            // s_row_absmax, freed once the hidden requant above consumed it),
+            // then quantize_rows writes int8 out + the [T] per-token scales.
+            // out_row_scales is only ever supplied via the per-channel entry
+            // point, so the weight is per-column here.
+            cudaMemsetAsync(s_row_absmax, 0, rows_sz);
+            gemm_int8_wmma_f16_kernel<false, true, true><<<grid2, THREADS_PER_BLOCK>>>(
+                s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
+                s_row_scales, scale_W2, s_row_absmax, nullptr);
+            const size_t o_vecs = (size_t)T * d_model / 8;
+            const int qb2 = (int)((o_vecs + 255) / 256 < 4096
+                                  ? (o_vecs + 255) / 256 : 4096);
+            quantize_rows_kernel<<<qb2, 256>>>(
+                s_out_f16, s_row_absmax, out, out_row_scales, T, d_model);
+            return;
+        }
+        // Legacy per-tensor output quant (per-tensor entry point).
+        if (w_per_channel)
+            gemm_int8_wmma_f16_kernel<false, true, true><<<grid2, THREADS_PER_BLOCK>>>(
+                s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
+                s_row_scales, scale_W2, nullptr, s_out_absmax);
+        else
+            gemm_int8_wmma_f16_kernel<false, true, false><<<grid2, THREADS_PER_BLOCK>>>(
+                s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
+                s_row_scales, scale_W2, nullptr, s_out_absmax);
 
         const size_t o_elems = (size_t)T * d_model;
         const int qb2 = (int)((o_elems / 8 + 255) / 256 < 4096
@@ -763,6 +825,38 @@ void int8_mlp_forward(
             s_hidden_int8, W2, out, T, d_model, d_ff,
             s_scale_hidden, scale_W2, s_inv_scale_out);
     }
+}
+
+// ── Public interface ───────────────────────────────────────────────────
+// Per-tensor scales (scale_x[0], scale_W1[0], scale_W2[0] scalars). Unchanged
+// signature — used by the tests/cuda/ .bin smoke test and the scalar binding.
+void int8_mlp_forward(
+    const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
+    const float* scale_x, const float* scale_W1, const float* scale_W2,
+    int batch, int seq_len, int d_model, int d_ff
+) {
+    int8_mlp_forward_impl(x, W1, W2, out, scale_x, scale_W1, scale_W2,
+                          batch, seq_len, d_model, d_ff,
+                          /*x_per_token=*/false, /*w_per_channel=*/false,
+                          /*out_row_scales=*/nullptr);
+}
+
+// Per-token activation + per-channel weight scales: scale_x is [T] (per token),
+// scale_W1 [d_ff] and scale_W2 [d_model] (per output channel). Requires the
+// WMMA dynamic path (shapes multiple of the tile sizes); the caller guarantees
+// that before selecting this entry point. The LLM.int8()-style accuracy fix.
+// The output is quantized PER-TOKEN: out_row_scales receives the [T] per-row
+// output scales (so the caller dequants per row, not by a single scalar).
+void int8_mlp_forward_per_channel(
+    const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
+    const float* scale_x, const float* scale_W1, const float* scale_W2,
+    float* out_row_scales,
+    int batch, int seq_len, int d_model, int d_ff
+) {
+    int8_mlp_forward_impl(x, W1, W2, out, scale_x, scale_W1, scale_W2,
+                          batch, seq_len, d_model, d_ff,
+                          /*x_per_token=*/true, /*w_per_channel=*/true,
+                          out_row_scales);
 }
 
 // Returns the static output scale from the most recent int8_mlp_forward call.
