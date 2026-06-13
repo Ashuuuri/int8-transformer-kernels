@@ -38,6 +38,16 @@
 #define DECODE_WARPS_PER_BLOCK 4
 #endif
 
+// Partial-kernel layout selector.  0 = original "lane owns dims" (a 6-step
+// warp-shuffle score reduction per KV position — instruction-bound at HEAD_DIM=64,
+// only ~25% HBM BW). 1 = dp4a "lane owns position": each lane computes a FULL
+// HEAD_DIM dot via __dp4a (no per-position reduction); the warp reduces only
+// twice per 32-position tile (softmax max/sum). PV stays in dims-layout (coalesced
+// V, p·sV broadcast by shuffle). See OPTIMIZATION_LOG iter 15.
+#ifndef INT8_DECODE_DP4A
+#define INT8_DECODE_DP4A 1
+#endif
+
 // ── Pass 1: per-(b,h, split) partial online-softmax over one KV chunk ──────
 template <int HEAD_DIM>
 __global__ void int8_decode_partial_kernel(
@@ -98,6 +108,106 @@ __global__ void int8_decode_partial_kernel(
         #pragma unroll
         for (int i = 0; i < DPL; ++i)
             acc[i] = acc[i] * corr + p * ((float)vj[i] * sv);
+        m = m_new;
+    }
+
+    if (lane == 0) { p_m[unit] = m; p_l[unit] = l; }
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i)
+        p_acc[(size_t)unit * HEAD_DIM + base + i] = acc[i];
+}
+
+// ── Pass 1 (dp4a variant): lane owns a KV POSITION, not dims ───────────────
+// Each iteration a warp handles a TILE of 32 KV positions: lane L scores
+// position (t+L) with a full HEAD_DIM dot via __dp4a — NO per-position shuffle
+// reduction. The warp reduces only twice per tile (softmax max + sum). For the
+// P·V accumulation we flip back to dims-layout (lane owns DPL dims of acc, V read
+// coalesced) and broadcast each position's p·sV with a single __shfl. So the
+// score path pays ~2 warp-reductions / 32 positions instead of 6 shuffles / 1.
+template <int HEAD_DIM>
+__global__ void int8_decode_partial_dp4a_kernel(
+    const int8_t* __restrict__ Q,   // [BH, HEAD_DIM]
+    const int8_t* __restrict__ K,   // [BH, S, HEAD_DIM]
+    const int8_t* __restrict__ V,   // [BH, S, HEAD_DIM]
+    const float*  __restrict__ sQ,  // [BH]
+    const float*  __restrict__ sK,  // [BH*S]
+    const float*  __restrict__ sV,  // [BH*S]
+    float* __restrict__ p_m,        // [BH*NSPLIT]
+    float* __restrict__ p_l,        // [BH*NSPLIT]
+    float* __restrict__ p_acc,      // [BH*NSPLIT, HEAD_DIM]  (unnormalized)
+    int S, int BH, int nsplit, int chunk, float attn_scale)
+{
+    constexpr int DPL = HEAD_DIM / 32;   // dims per lane for the acc/PV phase
+    constexpr int NW  = HEAD_DIM / 4;    // int32 words per row for dp4a (QK phase)
+    const int unit = blockIdx.x * DECODE_WARPS_PER_BLOCK + threadIdx.y;
+    if (unit >= BH * nsplit) return;
+    const int bh   = unit / nsplit;
+    const int sp   = unit % nsplit;
+    const int lane = threadIdx.x;
+    const int base = lane * DPL;
+
+    const int j0 = sp * chunk;
+    const int j1 = min(S, j0 + chunk);
+
+    // Q stays resident as NW int32 words (same for every position; packed int8x4).
+    int q[NW];
+    const int32_t* Qw = reinterpret_cast<const int32_t*>(Q + (size_t)bh * HEAD_DIM);
+    #pragma unroll
+    for (int w = 0; w < NW; ++w) q[w] = Qw[w];
+    const float sq = sQ[bh];
+
+    const int8_t* Kbh  = K  + (size_t)bh * S * HEAD_DIM;
+    const int8_t* Vbh  = V  + (size_t)bh * S * HEAD_DIM;
+    const float*  sKbh = sK + (size_t)bh * S;
+    const float*  sVbh = sV + (size_t)bh * S;
+
+    float m = -INFINITY, l = 0.0f;
+    float acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) acc[i] = 0.0f;
+
+    for (int t = j0; t < j1; t += 32) {
+        const int tile_n = min(32, j1 - t);
+        const bool valid = lane < tile_n;             // lane scores position t+lane
+
+        // QK: full-row dp4a, one score per lane, no reduction.
+        float score = -INFINITY;
+        float svl   = 0.0f;
+        if (valid) {
+            const int32_t* krow =
+                reinterpret_cast<const int32_t*>(Kbh + (size_t)(t + lane) * HEAD_DIM);
+            int dot = 0;
+            #pragma unroll
+            for (int w = 0; w < NW; ++w) dot = __dp4a(q[w], krow[w], dot);
+            score = (float)dot * sq * sKbh[t + lane] * attn_scale;
+            svl   = sVbh[t + lane];
+        }
+
+        // Softmax over the tile (2 warp reductions for the whole 32 positions).
+        float tile_max = score;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, o));
+        const float m_new = fmaxf(m, tile_max);
+        const float corr  = __expf(m - m_new);
+        const float p     = valid ? __expf(score - m_new) : 0.0f;
+        float tile_l = p;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            tile_l += __shfl_xor_sync(0xffffffffu, tile_l, o);
+        l = l * corr + tile_l;
+
+        // P·V: dims-layout. Rescale acc, then broadcast each position's p·sV and
+        // accumulate its (coalesced) V row into this lane's DPL dims.
+        const float psv = p * svl;     // lane L holds position (t+L)'s weight
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] *= corr;
+        for (int jj = 0; jj < tile_n; ++jj) {
+            const float w = __shfl_sync(0xffffffffu, psv, jj);
+            const int8_t* vrow = Vbh + (size_t)(t + jj) * HEAD_DIM + base;
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) acc[i] += w * (float)vrow[i];
+        }
         m = m_new;
     }
 
@@ -189,9 +299,19 @@ void int8_decode_attention_forward(
     dim3 gridP((units + DECODE_WARPS_PER_BLOCK - 1) / DECODE_WARPS_PER_BLOCK);
     dim3 gridC((BH    + DECODE_WARPS_PER_BLOCK - 1) / DECODE_WARPS_PER_BLOCK);
 
+    // Ship the empirically-best partial per head_dim (bench_attn_decode, iter 15):
+    //   HEAD_DIM=64  → dp4a lane-per-position WINS (1.24–1.56× @ B≥32, ~2× the BW);
+    //   HEAD_DIM=128 → dp4a REGRESSES to 0.86–0.93× (NW=32 Q-regs cut occupancy),
+    //                  so the original lane-per-dim split-KV (1.23×) stays.
+    // INT8_DECODE_DP4A=0 forces the original D=64 path too (A/B / ablation).
     if (head_dim == 64) {
+#if INT8_DECODE_DP4A
+        int8_decode_partial_dp4a_kernel<64><<<gridP, block>>>(
+            Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+#else
         int8_decode_partial_kernel<64><<<gridP, block>>>(
             Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+#endif
         int8_decode_combine_kernel<64><<<gridC, block>>>(
             out, p_m, p_l, p_acc, BH, nsplit);
     } else if (head_dim == 128) {
