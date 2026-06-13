@@ -172,6 +172,23 @@ using namespace nvcuda::wmma;
 // Maximum head_dim supported = ATTN_WMMA_N * ATTN_MAX_SLICES = 16 * 16 = 256.
 #define ATTN_MAX_SLICES 16
 
+// D = A·B + D — native INT8 tensor-core op: A s8 16x32, B s8 32x8, D s32 16x8.
+// Used for QK^T: replaces the WMMA m16n16k16 path's load_matrix_sync round-trips
+// with plain 4-byte smem reads (each thread's int8 lanes are head-dim-contiguous)
+// and one native instruction per call (WMMA m16n16k16.s8 decomposes into several).
+// The s32 accumulator element order (c0,c1 = rows groupID, cols 2*tid_in_grp,+1;
+// c2,c3 = rows groupID+8) is exactly two n-halves of the WMMA m16n16k16 layout,
+// so two calls (low/high n8) fill x[0..3]/x[4..7] and downstream code is unchanged.
+__device__ __forceinline__ void attn_mma_m16n8k32_s8(
+    int32_t* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 #if INT8_ATTN_REGPV
 // Load four 8x8 FP16 tiles with transpose: row-major V in smem comes back as
 // the col-major B fragments mma.m16n8k16 expects (r0/r1 = k0-7/k8-15 of the
@@ -361,23 +378,41 @@ void int8_wmma_attention_kernel(
         }
         __syncthreads();
 
-        // ── QK^T via INT8 WMMA → INT32 accumulator ──
-        // k outer / g inner: each Q fragment is loaded once per k-step and
-        // reused across all KV groups (was reloaded n_kv_groups times).
-        fragment<accumulator, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int32_t>
-            frag_qk[TILE_KV / ATTN_WMMA_N];
+        // ── QK^T via native INT8 mma.sync m16n8k32 → INT32 accumulators ──
+        // k-step is 32 (vs 16 for WMMA). Each logical n16 group g is two n8
+        // mma calls (kv cols g*16+0..7 and +8..15) whose s32 accumulators land
+        // in qk[g][0..3] / qk[g][4..7] — exactly the WMMA m16n16k16 .x[] order,
+        // so the cast/softmax/P@V code below is untouched. Operands are loaded
+        // as plain 4-byte smem reads instead of load_matrix_sync (each thread's
+        // 4 int8 lanes are head-dim-contiguous), removing the WMMA fragment-load
+        // smem round-trips that dominate the shared-memory wavefront count.
+        int32_t qk[TILE_KV / ATTN_WMMA_N][8];
         #pragma unroll
         for (int g = 0; g < n_kv_groups; ++g)
-            fill_fragment(frag_qk[g], (int32_t)0);
-        #pragma unroll 4
-        for (int k = 0; k < head_dim; k += ATTN_WMMA_K) {
-            fragment<matrix_a, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, row_major> fq;
-            load_matrix_sync(fq, s_Q_i8 + warp_id * ATTN_WMMA_M * ks_i8 + k, ks_i8);
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) qk[g][e] = 0;
+
+        const int groupID = lane >> 2;       // 0..7  (mma row / B-column index)
+        const int tid_grp = lane & 3;         // 0..3  (k-segment within a group)
+        const int8_t* qrow0 = s_Q_i8 + (warp_id * ATTN_WMMA_M + groupID) * ks_i8;
+        const int8_t* qrow8 = qrow0 + 8 * ks_i8;
+        #pragma unroll 2
+        for (int k = 0; k < head_dim; k += 32) {
+            const int ka = k + tid_grp * 4;
+            const uint32_t a0 = *reinterpret_cast<const uint32_t*>(qrow0 + ka);
+            const uint32_t a1 = *reinterpret_cast<const uint32_t*>(qrow8 + ka);
+            const uint32_t a2 = *reinterpret_cast<const uint32_t*>(qrow0 + ka + 16);
+            const uint32_t a3 = *reinterpret_cast<const uint32_t*>(qrow8 + ka + 16);
             #pragma unroll
             for (int g = 0; g < n_kv_groups; ++g) {
-                fragment<matrix_b, ATTN_WMMA_M, ATTN_WMMA_N, ATTN_WMMA_K, int8_t, col_major> fk;
-                load_matrix_sync(fk, s_K_i8 + g * ATTN_WMMA_N * ks_i8 + k, ks_i8);
-                mma_sync(frag_qk[g], fq, fk, frag_qk[g]);
+                const int8_t* krl = s_K_i8 + (g * ATTN_WMMA_N + groupID) * ks_i8;
+                const int8_t* krh = krl + 8 * ks_i8;
+                const uint32_t b0l = *reinterpret_cast<const uint32_t*>(krl + ka);
+                const uint32_t b1l = *reinterpret_cast<const uint32_t*>(krl + ka + 16);
+                const uint32_t b0h = *reinterpret_cast<const uint32_t*>(krh + ka);
+                const uint32_t b1h = *reinterpret_cast<const uint32_t*>(krh + ka + 16);
+                attn_mma_m16n8k32_s8(&qk[g][0], a0, a1, a2, a3, b0l, b1l);
+                attn_mma_m16n8k32_s8(&qk[g][4], a0, a1, a2, a3, b0h, b1h);
             }
         }
 
@@ -413,14 +448,14 @@ void int8_wmma_attention_kernel(
             float sK_c8 = s_scale_K[kc_base + fcol_lo + 8];
             float sK_c9 = s_scale_K[kc_base + fcol_lo + 9];
 
-            sf[g][0] = (float)frag_qk[g].x[0] * r_sQ0 * sK_c0;
-            sf[g][1] = (float)frag_qk[g].x[1] * r_sQ0 * sK_c1;
-            sf[g][2] = (float)frag_qk[g].x[2] * r_sQ1 * sK_c0;
-            sf[g][3] = (float)frag_qk[g].x[3] * r_sQ1 * sK_c1;
-            sf[g][4] = (float)frag_qk[g].x[4] * r_sQ0 * sK_c8;
-            sf[g][5] = (float)frag_qk[g].x[5] * r_sQ0 * sK_c9;
-            sf[g][6] = (float)frag_qk[g].x[6] * r_sQ1 * sK_c8;
-            sf[g][7] = (float)frag_qk[g].x[7] * r_sQ1 * sK_c9;
+            sf[g][0] = (float)qk[g][0] * r_sQ0 * sK_c0;
+            sf[g][1] = (float)qk[g][1] * r_sQ0 * sK_c1;
+            sf[g][2] = (float)qk[g][2] * r_sQ1 * sK_c0;
+            sf[g][3] = (float)qk[g][3] * r_sQ1 * sK_c1;
+            sf[g][4] = (float)qk[g][4] * r_sQ0 * sK_c8;
+            sf[g][5] = (float)qk[g][5] * r_sQ0 * sK_c9;
+            sf[g][6] = (float)qk[g][6] * r_sQ1 * sK_c8;
+            sf[g][7] = (float)qk[g][7] * r_sQ1 * sK_c9;
 
             lmax0 = fmaxf(lmax0, fmaxf(fmaxf(sf[g][0],sf[g][1]), fmaxf(sf[g][4],sf[g][5])));
             lmax1 = fmaxf(lmax1, fmaxf(fmaxf(sf[g][2],sf[g][3]), fmaxf(sf[g][6],sf[g][7])));
