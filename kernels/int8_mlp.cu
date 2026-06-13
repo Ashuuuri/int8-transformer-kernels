@@ -48,12 +48,35 @@ __device__ __forceinline__ void atomic_max_pos_f32(float* addr, float val) {
 #define STAGE_K          INT8_MLP_STAGE_K
 #define BLOCK_M          128                                    // was 64
 #define BLOCK_N          128                                    // was 64
+// Iter 12 NEGATIVE RESULT (OFF by default — INT8_MLP_FINE_WARP=1 to enable):
+// finer 4×4 warp tiling. Each warp owns a 2×2 sub-grid of 16×16 tiles
+// (acc[2][2][8] = 32 s32 regs, was acc[2][4][8] = 64) so the 128×128 block is
+// covered by 16 warps / 512 threads (was 4×2 / 8 warps / 256). At
+// launch_bounds(512,2) this DID reach ~32 warps/SM (warps_active 23.8/21.5% →
+// 47.6/41.9%) and the smaller acc DID halve the IMMA-result `wait` stall
+// (GEMM2 28.2%→14.5%, GEMM1 19.0%→13.7%) — confirming more IMMA-issuing warps
+// relieve `wait`. BUT halving the acc forced WARP_COL_TILES 4→2, which halves
+// A/B-fragment reuse: `short_scoreboard` (smem LDS) rose (GEMM2 0.7%→4.4%) and
+// per-warp arithmetic intensity dropped, so `tensor_op_imma` NET FELL
+// (38.3%→29.8% / 30.2%→24.6%) and latency regressed +15% to +28% across the
+// 12-pt sweep (graded d1024/s512 0.51→0.60ms). The finer tile's lost operand
+// reuse more than cancels the occupancy/wait win. This CLOSES the occupancy
+// lever from the opposite side of iters 8/10: you CAN raise occupancy (via a
+// finer tile) and it DOES cut `wait`, but the reuse you trade away costs more.
+// Do not re-attempt finer warp tiling for occupancy.
+#ifndef INT8_MLP_FINE_WARP
+#define INT8_MLP_FINE_WARP 0
+#endif
 #define WARP_ROW_TILES   2                                      // each warp: 2 row tiles (32 rows)
-#define WARP_COL_TILES   4                                      // each warp: 4 col tiles (64 cols)
+#if INT8_MLP_FINE_WARP
+#define WARP_COL_TILES   2                                      // 16 warps/512 thr, acc[2][2][8]=32 regs
+#else
+#define WARP_COL_TILES   4                                      // 8 warps/256 thr, acc[2][4][8]=64 regs (default)
+#endif
 #define WARP_ROW_GROUPS  (BLOCK_M / WMMA_M / WARP_ROW_TILES)   // 4
-#define WARP_COL_GROUPS  (BLOCK_N / WMMA_N / WARP_COL_TILES)   // 2
-#define WARPS_PER_BLOCK  (WARP_ROW_GROUPS * WARP_COL_GROUPS)   // 8
-#define THREADS_PER_BLOCK (WARPS_PER_BLOCK * 32)                // 256
+#define WARP_COL_GROUPS  (BLOCK_N / WMMA_N / WARP_COL_TILES)   // 2 (default) / 4 (fine)
+#define WARPS_PER_BLOCK  (WARP_ROW_GROUPS * WARP_COL_GROUPS)   // 8 (default) / 16 (fine)
+#define THREADS_PER_BLOCK (WARPS_PER_BLOCK * 32)                // 256 (default) / 512 (fine)
 #define SCALAR_TILE      16
 
 // INT8 smem padding: 16 bytes per row
