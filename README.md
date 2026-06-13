@@ -119,7 +119,7 @@ bench_block.py               end-to-end transformer-block wall-clock (INT8 vs FP
 benchmark.py / baseline.py / correctness.py   timing + PyTorch references
 evolve.sh                    autonomous profile -> optimize -> validate -> commit loop
 
-CLAUDE.md                    agent operating guide (the optimization "心法")
+CLAUDE.md                    agent operating guide (the optimization principles)
 OPTIMIZATION.md              structured iteration log (the full evidence trail)
 ```
 

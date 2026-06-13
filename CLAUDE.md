@@ -1,7 +1,7 @@
 # CLAUDE.md — operating guide for int8-transformer-kernels
 
-This is the **心法**: how an agent should think and act when continuing the INT8
-kernel optimization in this repo. It is the distilled, *still-actionable*
+This is the **operating guide**: how an agent should think and act when
+continuing the INT8 kernel optimization in this repo. It is the distilled, *still-actionable*
 conclusion of ~18 iterations. The blow-by-blow evidence behind every claim —
 before/after `ncu` numbers, validation traces, negative results — lives in
 [`OPTIMIZATION.md`](OPTIMIZATION.md). This file tells you **what to do and what
