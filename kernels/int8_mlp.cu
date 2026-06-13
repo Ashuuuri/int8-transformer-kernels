@@ -31,6 +31,27 @@
 #define INT8_MLP_DYNAMIC 1
 #endif
 
+// Iter 13 NEGATIVE RESULT (OFF by default — INT8_MLP_FUSE_QUANT=1 to enable):
+// fuse the standalone quantize_rows pass (FP16 hidden → INT8) into GEMM2's
+// staged smem load. GEMM2 reads the FP16 hidden directly and quantizes each
+// per-token row on-the-fly (using the per-row absmax GEMM1 already wrote),
+// eliminating one kernel launch and the int8-hidden HBM write+read round-trip
+// (the standalone quantize_rows is ~8% of the graded forward). Output is
+// numerically IDENTICAL (all 5 gates pass, Gate 5 −0.068%), but it REGRESSED
+// the graded sweep +45% to +63% (d1024/s512 0.51→0.74ms, d2048/s4096
+// 9.79→15.94ms). Cause: GEMM2 is wait-bound, and the on-load conversion adds a
+// serial `convert + __syncthreads` per K-stage BETWEEN the cp.async-wait and
+// the mma (not overlapped with compute), plus the FP16 staging doubles A's load
+// bytes; over 64–128 K-stages that serial overhead more than doubles GEMM2,
+// swamping the 8% quantize_rows saving. RULES OUT fusing the hidden requant
+// into GEMM2's load path — the separate memory-bound quantize_rows (running at
+// ~70% HBM BW) is cheaper than paying conversion latency inside the latency-
+// bound GEMM. Do not re-attempt without first decoupling the convert from the
+// mma critical path (triple-buffer / convert-during-previous-mma).
+#ifndef INT8_MLP_FUSE_QUANT
+#define INT8_MLP_FUSE_QUANT 0
+#endif
+
 using namespace nvcuda;
 
 // atomicMax for non-negative floats via integer reinterpretation.
@@ -88,6 +109,9 @@ __device__ __forceinline__ void atomic_max_pos_f32(float* addr, float val) {
 // mod 32 is a bijection over the 32 lanes → conflict-free, unlike the WMMA
 // load_matrix_sync path it replaces.
 #define B_SMEM_STRIDE    (STAGE_K + SMEM_SKEW)                  // 48
+// FP16 hidden staging stride (iter 13 fused path): STAGE_K halves + 8-half skew
+// (16 B, keeps the half2 convert reads off a single bank). Halves, not bytes.
+#define SH_STRIDE        (STAGE_K + 8)                          // 72
 
 // cp.async: 16 bytes per copy = 16 INT8 elements
 #define A_COPIES_PER_ROW (STAGE_K / 16)                         // 2
@@ -449,6 +473,284 @@ void gemm_int8_wmma_f16_kernel(
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Iter 13 — fused quantize-on-load GEMM2 (A operand is FP16 hidden)
+// ════════════════════════════════════════════════════════════════════════
+// Instead of a standalone quantize_rows kernel writing an INT8 hidden to HBM
+// for GEMM2 to read back, GEMM2 reads the FP16 hidden directly and quantizes
+// each per-token row to INT8 *in shared memory* as it stages each K-slab,
+// using the per-row absmax GEMM1 left in d_row_absmax. The hand-rolled
+// m16n8k32 main loop and the FP16-output epilogue are otherwise identical to
+// gemm_int8_wmma_f16_kernel; only the A path differs.
+
+// Stage one BLOCK_M×STAGE_K slab of the FP16 A (hidden) into sH and one
+// BLOCK_N×STAGE_K slab of the transposed INT8 B into sB, both via cp.async.
+__device__ __forceinline__ void load_fused_tile_async(
+    const half* __restrict__ A16,
+    const int8_t* __restrict__ BT,
+    half* sH, int8_t* sB,
+    int block_m, int block_n, int k0, int K, int N
+) {
+    (void)N;
+    const int A_COPIES_FP16_PER_ROW = STAGE_K / 8;        // 16B = 8 halves → 8
+    const int A_COPIES = BLOCK_M * A_COPIES_FP16_PER_ROW;  // 128×8 = 1024
+    const int B_COPIES = BLOCK_N * B_COPIES_PER_ROW;       // 128×2 = 256
+    const int TOTAL    = A_COPIES + B_COPIES;
+
+    for (int c = threadIdx.x; c < TOTAL; c += THREADS_PER_BLOCK) {
+        if (c < A_COPIES) {
+            const int row = c / A_COPIES_FP16_PER_ROW;     // m row 0..127
+            const int col = (c % A_COPIES_FP16_PER_ROW) * 8; // half offset
+            i8_cp_async_16B(sH + row * SH_STRIDE + col,
+                            A16 + (size_t)(block_m + row) * K + k0 + col);
+        } else {
+            const int bc  = c - A_COPIES;
+            const int row = bc / B_COPIES_PER_ROW;          // n row 0..127
+            const int col = (bc % B_COPIES_PER_ROW) * 16;   // k offset
+            i8_cp_async_16B(sB + row * B_SMEM_STRIDE + col,
+                            BT + (size_t)(block_n + row) * K + k0 + col);
+        }
+    }
+}
+
+// Convert one staged FP16 A slab (sH) to the INT8 layout the mma loop expects
+// (sA), applying the per-token (per-row) quantization scale 127/amax.
+__device__ __forceinline__ void convert_fp16A_to_int8(
+    const half* __restrict__ sH, int8_t* __restrict__ sA,
+    const float* __restrict__ s_inv_arow
+) {
+    const int HALF2_PER_ROW = STAGE_K / 2;                 // 32
+    const int total = BLOCK_M * HALF2_PER_ROW;             // 4096
+    for (int idx = threadIdx.x; idx < total; idx += THREADS_PER_BLOCK) {
+        const int r  = idx / HALF2_PER_ROW;
+        const int c2 = idx % HALF2_PER_ROW;
+        const float inv = s_inv_arow[r];
+        const half2 h = *reinterpret_cast<const half2*>(sH + r * SH_STRIDE + c2 * 2);
+        const float2 f = __half22float2(h);
+        sA[r * A_SMEM_STRIDE + c2 * 2]     = f32_to_i8(f.x, inv);
+        sA[r * A_SMEM_STRIDE + c2 * 2 + 1] = f32_to_i8(f.y, inv);
+    }
+}
+
+// FP16-A main loop: same m16n8k32 schedule as mlp_int8_mainloop, but each stage
+// is staged as FP16 then converted to INT8 in smem before the mma reads it.
+__device__ __forceinline__ void mlp_int8_mainloop_fp16a(
+    const half* __restrict__ A16,
+    const int8_t* __restrict__ BT,
+    half* sH0, half* sH1, int8_t* sA0, int8_t* sA1, int8_t* sB0, int8_t* sB1,
+    const float* __restrict__ s_inv_arow,
+    int M, int N, int K, int block_m, int block_n,
+    int warp_m, int warp_ng, int lane,
+    int32_t acc[WARP_ROW_TILES][WARP_COL_TILES][8]
+) {
+    (void)M;
+    half*   sH[2] = {sH0, sH1};
+    int8_t* sA[2] = {sA0, sA1};
+    int8_t* sB[2] = {sB0, sB1};
+
+    #pragma unroll
+    for (int rt = 0; rt < WARP_ROW_TILES; rt++)
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++)
+            #pragma unroll
+            for (int e = 0; e < 8; e++) acc[rt][ct][e] = 0;
+
+    const int groupID = lane >> 2;
+    const int tid_grp = lane & 3;
+
+    int stage = 0;
+    load_fused_tile_async(A16, BT, sH[0], sB[0], block_m, block_n, 0, K, N);
+    i8_cp_async_commit();
+
+    for (int k0 = 0; k0 < K; k0 += STAGE_K) {
+        i8_cp_async_wait_all();
+        __syncthreads();
+
+        const int next_k0 = k0 + STAGE_K;
+        const int next_s  = stage ^ 1;
+        if (next_k0 < K) {
+            load_fused_tile_async(A16, BT, sH[next_s], sB[next_s],
+                                  block_m, block_n, next_k0, K, N);
+            i8_cp_async_commit();
+        }
+        // Quantize this stage's FP16 A → INT8 sA (overlaps the next cp.async).
+        convert_fp16A_to_int8(sH[stage], sA[stage], s_inv_arow);
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < STAGE_K; kk += 32) {
+            #pragma unroll
+            for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
+                const int8_t* ar0 = sA[stage]
+                    + ((warp_m * WARP_ROW_TILES + rt) * WMMA_M + groupID) * A_SMEM_STRIDE;
+                const int8_t* ar8 = ar0 + 8 * A_SMEM_STRIDE;
+                const int ka = kk + tid_grp * 4;
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(ar0 + ka);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(ar8 + ka);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(ar0 + ka + 16);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(ar8 + ka + 16);
+                #pragma unroll
+                for (int ct = 0; ct < WARP_COL_TILES; ct++) {
+                    const int colbase = (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
+                    const int8_t* bl = sB[stage] + (colbase + groupID) * B_SMEM_STRIDE;
+                    const int8_t* bh = bl + 8 * B_SMEM_STRIDE;
+                    const uint32_t b0l = *reinterpret_cast<const uint32_t*>(bl + ka);
+                    const uint32_t b1l = *reinterpret_cast<const uint32_t*>(bl + ka + 16);
+                    const uint32_t b0h = *reinterpret_cast<const uint32_t*>(bh + ka);
+                    const uint32_t b1h = *reinterpret_cast<const uint32_t*>(bh + ka + 16);
+                    mlp_mma_m16n8k32_s8(&acc[rt][ct][0], a0, a1, a2, a3, b0l, b1l);
+                    mlp_mma_m16n8k32_s8(&acc[rt][ct][4], a0, a1, a2, a3, b0h, b1h);
+                }
+            }
+        }
+
+        __syncthreads();
+        stage = next_s;
+    }
+}
+
+// Fused GEMM2: C(FP16) = dequant( quant_per_row(A_FP16) × B_INT8 ).  The A scale
+// is per-row (per-token), derived from a_row_absmax (GEMM1's per-token hidden
+// absmax): inv = 127/amax for the on-load quant, sa = amax/127 for the dequant.
+// b_scale_per_col selects per-channel (per-output-col) vs per-tensor weight
+// scale. d_row_absmax / d_out_absmax gather the OUTPUT statistics exactly as in
+// gemm_int8_wmma_f16_kernel. Uses dynamic smem (FP16 staging pushes past 48 KB).
+template <bool apply_gelu, bool b_scale_per_col>
+__global__ __launch_bounds__(THREADS_PER_BLOCK, 2)
+void gemm_int8_wmma_f16_a16fused_kernel(
+    const half* __restrict__    A16,
+    const int8_t* __restrict__  BT,
+    half* __restrict__          C,
+    int M, int N, int K,
+    const float* __restrict__ a_row_absmax,
+    const float* __restrict__ d_scale_B,
+    float* __restrict__ d_row_absmax,
+    float* __restrict__ d_out_absmax
+) {
+    extern __shared__ __align__(16) char _smem[];
+    half*   sH0 = reinterpret_cast<half*>(_smem);
+    half*   sH1 = sH0 + BLOCK_M * SH_STRIDE;
+    int8_t* sA0 = reinterpret_cast<int8_t*>(sH1 + BLOCK_M * SH_STRIDE);
+    int8_t* sA1 = sA0 + BLOCK_M * A_SMEM_STRIDE;
+    int8_t* sB0 = sA1 + BLOCK_M * A_SMEM_STRIDE;
+    int8_t* sB1 = sB0 + BLOCK_N * B_SMEM_STRIDE;
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warp_m  = warp_id / WARP_COL_GROUPS;
+    const int warp_ng = warp_id % WARP_COL_GROUPS;
+
+    const int block_m = blockIdx.y * BLOCK_M;
+    const int block_n = blockIdx.x * BLOCK_N;
+
+    // Per-row A scales (from the hidden absmax) staged once: s_inv_arow drives
+    // the on-load quant, s_arow the epilogue dequant. s_bcol = per-col weight.
+    __shared__ float s_inv_arow[BLOCK_M];
+    __shared__ float s_arow[BLOCK_M];
+    __shared__ float s_bcol[BLOCK_N];
+    __shared__ float s_rowstat[BLOCK_M];
+    __shared__ float s_outmax;
+    for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK) {
+        const float am = fmaxf(__ldg(&a_row_absmax[block_m + i]), 1e-8f);
+        s_inv_arow[i] = 127.f / am;
+        s_arow[i]     = am / 127.f;
+    }
+    if (b_scale_per_col)
+        for (int i = threadIdx.x; i < BLOCK_N; i += THREADS_PER_BLOCK)
+            s_bcol[i] = __ldg(&d_scale_B[block_n + i]);
+    __syncthreads();
+
+    int32_t acc[WARP_ROW_TILES][WARP_COL_TILES][8];
+    mlp_int8_mainloop_fp16a(A16, BT, sH0, sH1, sA0, sA1, sB0, sB1,
+                            s_inv_arow, M, N, K, block_m, block_n,
+                            warp_m, warp_ng, lane_id, acc);
+
+    // Epilogue: INT32 → float → ×sa·sb → [GELU] → FP16 (+ output absmax stats).
+    int32_t* c_smem = reinterpret_cast<int32_t*>(_smem);
+    int32_t* c_base = c_smem + warp_id * WARP_COL_TILES * WMMA_M * WMMA_N;
+
+    const float scaleB0 = b_scale_per_col ? 0.f : __ldg(d_scale_B);
+
+    if (d_row_absmax != nullptr)
+        for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
+            s_rowstat[i] = 0.f;
+    if (d_out_absmax != nullptr && threadIdx.x == 0)
+        s_outmax = 0.f;
+    if (d_row_absmax != nullptr || d_out_absmax != nullptr)
+        __syncthreads();
+
+    float tmax = 0.f;
+
+    #pragma unroll
+    for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++)
+            mlp_store_acc16(c_base + ct * WMMA_M * WMMA_N, acc[rt][ct], lane_id);
+        __syncwarp();
+
+        const int row_base = block_m + (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
+        const int col_base = block_n + warp_ng * WARP_COL_TILES * WMMA_N;
+        const int blk_row_base = (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
+
+        float rmax8[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) rmax8[j] = 0.f;
+
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++) {
+            int32_t* cp = c_base + ct * WMMA_M * WMMA_N;
+            const int tile_col = col_base + ct * WMMA_N;
+            const int btile_col = (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
+            #pragma unroll
+            for (int j = 0; j < (WMMA_M * WMMA_N) / 32; j++) {
+                const int i = lane_id + j * 32;
+                const int r = i / WMMA_N, c = i % WMMA_N;
+                const float sa = s_arow[blk_row_base + r];
+                const float sb = b_scale_per_col ? s_bcol[btile_col + c]
+                                                 : scaleB0;
+                float v = (float)cp[i] * sa * sb;
+                if (apply_gelu) v = int8_gelu(v);
+                C[(row_base + r) * N + (tile_col + c)] = __float2half_rn(v);
+                if (d_row_absmax != nullptr)
+                    rmax8[j] = fmaxf(rmax8[j], fabsf(v));
+                if (d_out_absmax != nullptr)
+                    tmax = fmaxf(tmax, fabsf(v));
+            }
+        }
+
+        if (d_row_absmax != nullptr) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float m = rmax8[j];
+                #pragma unroll
+                for (int off = 8; off >= 1; off >>= 1)
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+                if ((lane_id & 15) == 0) {
+                    const int r = lane_id / 16 + 2 * j;
+                    atomicMax(reinterpret_cast<int*>(&s_rowstat[blk_row_base + r]),
+                              __float_as_int(m));
+                }
+            }
+        }
+    }
+
+    if (d_out_absmax != nullptr) {
+        #pragma unroll
+        for (int off = 16; off >= 1; off >>= 1)
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+        if (lane_id == 0)
+            atomicMax(reinterpret_cast<int*>(&s_outmax), __float_as_int(tmax));
+    }
+    if (d_row_absmax != nullptr || d_out_absmax != nullptr) {
+        __syncthreads();
+        if (d_row_absmax != nullptr)
+            for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
+                atomic_max_pos_f32(&d_row_absmax[block_m + i], s_rowstat[i]);
+        if (d_out_absmax != nullptr && threadIdx.x == 0)
+            atomic_max_pos_f32(d_out_absmax, s_outmax);
+    }
+}
+
 // ── Dynamic-quant helper kernels ───────────────────────────────────────
 // Quantize the FP16 hidden matrix row-by-row using the absmax gathered in
 // the GEMM1 epilogue; also emits the per-row scales for GEMM2.
@@ -778,21 +1080,66 @@ static void int8_mlp_forward_impl(
                 x, W1T, s_hidden_f16, T, d_ff, d_model,
                 scale_x, scale_W1, s_row_absmax, nullptr);
 
+        dim3 grid2(d_model / BLOCK_N, T / BLOCK_M);
+#if INT8_MLP_FUSE_QUANT
+        // ── Fused path (iter 13): GEMM2 reads the FP16 hidden directly and
+        // quantizes each per-token row to INT8 in smem during the staged load,
+        // using GEMM1's per-row absmax (s_row_absmax). The standalone
+        // quantize_rows + INT8-hidden HBM round-trip is gone. The fused kernel
+        // needs > 48 KB smem (FP16 staging), so opt into the larger carveout
+        // once per instantiation.
+        constexpr int SMEM_FUSED =
+            2 * BLOCK_M * SH_STRIDE * (int)sizeof(half) +
+            2 * BLOCK_M * A_SMEM_STRIDE + 2 * BLOCK_N * B_SMEM_STRIDE;
+        static bool s_fused_attr_set = false;
+        if (!s_fused_attr_set) {
+            cudaFuncSetAttribute(
+                gemm_int8_wmma_f16_a16fused_kernel<false, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_FUSED);
+            cudaFuncSetAttribute(
+                gemm_int8_wmma_f16_a16fused_kernel<false, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_FUSED);
+            s_fused_attr_set = true;
+        }
+
+        if (out_row_scales) {
+            // Per-token output quant. The fused GEMM2 consumes s_row_absmax (the
+            // hidden absmax) as its A scale, so the OUTPUT per-row absmax goes to
+            // a separate buffer — reuse s_row_scales, now free (fusion dropped
+            // the hidden requant that used it). out_row_scales is only supplied
+            // via the per-channel entry point → weight is per-column here.
+            cudaMemsetAsync(s_row_scales, 0, rows_sz);
+            gemm_int8_wmma_f16_a16fused_kernel<false, true>
+                <<<grid2, THREADS_PER_BLOCK, SMEM_FUSED>>>(
+                    s_hidden_f16, W2T, s_out_f16, T, d_model, d_ff,
+                    s_row_absmax, scale_W2, s_row_scales, nullptr);
+            const size_t o_vecs = (size_t)T * d_model / 8;
+            const int qb2 = (int)((o_vecs + 255) / 256 < 4096
+                                  ? (o_vecs + 255) / 256 : 4096);
+            quantize_rows_kernel<<<qb2, 256>>>(
+                s_out_f16, s_row_scales, out, out_row_scales, T, d_model);
+            return;
+        }
+        // Legacy per-tensor output quant (per-tensor entry point).
+        if (w_per_channel)
+            gemm_int8_wmma_f16_a16fused_kernel<false, true>
+                <<<grid2, THREADS_PER_BLOCK, SMEM_FUSED>>>(
+                    s_hidden_f16, W2T, s_out_f16, T, d_model, d_ff,
+                    s_row_absmax, scale_W2, nullptr, s_out_absmax);
+        else
+            gemm_int8_wmma_f16_a16fused_kernel<false, false>
+                <<<grid2, THREADS_PER_BLOCK, SMEM_FUSED>>>(
+                    s_hidden_f16, W2T, s_out_f16, T, d_model, d_ff,
+                    s_row_absmax, scale_W2, nullptr, s_out_absmax);
+#else
+        // ── Unfused path: standalone quantize_rows then INT8-input GEMM2 ─────
         const size_t h_vecs = (size_t)T * d_ff / 8;
         const int qb1 = (int)((h_vecs + 255) / 256 < 4096
                               ? (h_vecs + 255) / 256 : 4096);
         quantize_rows_kernel<<<qb1, 256>>>(
             s_hidden_f16, s_row_absmax, s_hidden_int8, s_row_scales, T, d_ff);
 
-        // GEMM2: A=hidden (always per-token), B=W2.  b_scale_per_col =
-        // w_per_channel (scale_W2 is [d_model] or [1]).
-        dim3 grid2(d_model / BLOCK_N, T / BLOCK_M);
         if (out_row_scales) {
-            // Per-token output quant: GEMM2 gathers per-ROW output absmax (reuse
-            // s_row_absmax, freed once the hidden requant above consumed it),
-            // then quantize_rows writes int8 out + the [T] per-token scales.
-            // out_row_scales is only ever supplied via the per-channel entry
-            // point, so the weight is per-column here.
             cudaMemsetAsync(s_row_absmax, 0, rows_sz);
             gemm_int8_wmma_f16_kernel<false, true, true><<<grid2, THREADS_PER_BLOCK>>>(
                 s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
@@ -804,7 +1151,6 @@ static void int8_mlp_forward_impl(
                 s_out_f16, s_row_absmax, out, out_row_scales, T, d_model);
             return;
         }
-        // Legacy per-tensor output quant (per-tensor entry point).
         if (w_per_channel)
             gemm_int8_wmma_f16_kernel<false, true, true><<<grid2, THREADS_PER_BLOCK>>>(
                 s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
@@ -813,6 +1159,7 @@ static void int8_mlp_forward_impl(
             gemm_int8_wmma_f16_kernel<false, true, false><<<grid2, THREADS_PER_BLOCK>>>(
                 s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
                 s_row_scales, scale_W2, nullptr, s_out_absmax);
+#endif  // INT8_MLP_FUSE_QUANT
 
         const size_t o_elems = (size_t)T * d_model;
         const int qb2 = (int)((o_elems / 8 + 255) / 256 < 4096
