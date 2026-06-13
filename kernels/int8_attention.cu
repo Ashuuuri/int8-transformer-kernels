@@ -260,6 +260,9 @@ void int8_wmma_attention_kernel(
     half*   s_V_fp16  = (half*)(s_K_i8 + TILE_KV * ks_i8);
 #if INT8_ATTN_REGPV
     float*  s_scale_K = (float*)(s_V_fp16 + TILE_KV * vs);
+    // V's per-token scale is folded into the softmax weights (see weights loop),
+    // so s_V_fp16 holds the raw INT8→FP16 cast of V; sV is staged here instead.
+    float*  s_scale_V = s_scale_K + TILE_KV;
 #else
     half*   s_scores  = s_V_fp16 + TILE_KV * vs;
     float*  s_scale_K = (float*)(s_scores + ATTN_TILE_Q * ss);
@@ -360,21 +363,34 @@ void int8_wmma_attention_kernel(
             // K: vectorized INT8 load
             *reinterpret_cast<int4*>(&s_K_i8[row * ks_i8 + col]) =
                 *reinterpret_cast<const int4*>(&K[goff]);
-            // V: vectorized load + per-row dequant to FP16
+            // V: vectorized load + INT8→FP16 cast.
             int4 v_vec = *reinterpret_cast<const int4*>(&V[goff]);
-            const float sv = __ldg(&d_scale_V[scale_base + row]);
             const int8_t* vb = reinterpret_cast<const int8_t*>(&v_vec);
             half* vdst = &s_V_fp16[row * vs + col];
+#if INT8_ATTN_REGPV
+            // sV folded into softmax weights → raw cast here.
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
+                    __float2half((float)vb[2*i]),
+                    __float2half((float)vb[2*i + 1]));
+            }
+#else
+            const float sv = __ldg(&d_scale_V[scale_base + row]);
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
                     __float2half((float)vb[2*i]     * sv),
                     __float2half((float)vb[2*i + 1] * sv));
             }
+#endif
         }
 #endif
         for (int idx = tid; idx < TILE_KV; idx += ATTN_BDIM) {
             s_scale_K[idx] = __ldg(&d_scale_K[scale_base + idx]);
+#if INT8_ATTN_REGPV
+            s_scale_V[idx] = __ldg(&d_scale_V[scale_base + idx]);
+#endif
         }
         __syncthreads();
 
@@ -426,15 +442,25 @@ void int8_wmma_attention_kernel(
             const int byte_off = vi * 16;
             const int row = byte_off / head_dim;
             const int col = byte_off % head_dim;
-            const float sv = v_scales[r];
             const int8_t* vb = reinterpret_cast<const int8_t*>(&v_regs[r]);
             half* vdst = &s_V_fp16[row * vs + col];
+#if INT8_ATTN_REGPV
+            // sV folded into softmax weights → raw cast here.
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
+                    __float2half((float)vb[2*i]),
+                    __float2half((float)vb[2*i + 1]));
+            }
+#else
+            const float sv = v_scales[r];
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 reinterpret_cast<half2*>(vdst)[i] = __halves2half2(
                     __float2half((float)vb[2*i]     * sv),
                     __float2half((float)vb[2*i + 1] * sv));
             }
+#endif
         }
 #endif
 
@@ -511,11 +537,18 @@ void int8_wmma_attention_kernel(
             const float u0=__expf(sf[g][2]-rmax1), u1=__expf(sf[g][3]-rmax1);
             const float u8=__expf(sf[g][6]-rmax1), u9=__expf(sf[g][7]-rmax1);
             lsum1 += u0+u1+u8+u9;
+            // Fold V's per-token scale (sV, indexed by KV column) into the
+            // weights here — reused across all head-dim slices below, so this
+            // is fewer multiplies than scaling every V element, and keeps the
+            // V load a raw cast. lsum stays on the unscaled softmax weights.
+            const int kc = g * ATTN_WMMA_N + fcol_lo;
+            const float sv0=s_scale_V[kc],   sv1=s_scale_V[kc+1];
+            const float sv8=s_scale_V[kc+8], sv9=s_scale_V[kc+9];
             uint32_t pf[4];
-            pf[0] = attn_pack_half2(w0, w1);
-            pf[1] = attn_pack_half2(u0, u1);
-            pf[2] = attn_pack_half2(w8, w9);
-            pf[3] = attn_pack_half2(u8, u9);
+            pf[0] = attn_pack_half2(w0*sv0, w1*sv1);
+            pf[1] = attn_pack_half2(u0*sv0, u1*sv1);
+            pf[2] = attn_pack_half2(w8*sv8, w9*sv9);
+            pf[3] = attn_pack_half2(u8*sv8, u9*sv9);
             #pragma unroll
             for (int s = 0; s < n_slices; ++s) {
                 uint32_t b0, b1, b2, b3;
@@ -931,7 +964,9 @@ void int8_attention_forward(
                    (size_t)tile_kv * ks_i8_host +                  // K (INT8)
                    (size_t)tile_kv * vs_host * sizeof(half) +      // V (FP16)
                    (size_t)tile_kv * sizeof(float);                // K_scales
-#if !INT8_ATTN_REGPV
+#if INT8_ATTN_REGPV
+            sz += (size_t)tile_kv * sizeof(float);                 // V_scales
+#else
             sz += (size_t)ATTN_TILE_Q *
                   (tile_kv + ATTN_SMEM_PAD) * sizeof(half);        // scores (FP16)
 #endif
