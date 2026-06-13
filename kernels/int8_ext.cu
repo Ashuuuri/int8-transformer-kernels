@@ -30,6 +30,12 @@ void int8_attention_forward(
     int batch, int heads, int seq_len, int head_dim
 );
 
+void int8_decode_attention_forward(
+    const int8_t* Q, const int8_t* K, const int8_t* V, half* out,
+    const float* scale_Q, const float* scale_K, const float* scale_V,
+    int BH, int S, int head_dim
+);
+
 void int8_mlp_forward(
     const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
     const float* scale_x, const float* scale_W1, const float* scale_W2,
@@ -112,6 +118,55 @@ torch::Tensor int8_attention_forward_torch(
         batch, heads, seq_len, head_dim
     );
 
+    return out;
+}
+
+// ── INT8 decode attention binding (seq_q == 1, flash-decoding) ─────────
+// Q       : (batch, heads, head_dim)        torch.int8  CUDA  (the single new token)
+// K, V    : (batch, heads, seq_kv, head_dim) torch.int8  CUDA  (the KV cache)
+// scale_Q : (batch*heads,)            scale_K/V : (batch*heads*seq_kv,)  float32 CUDA
+// returns : (batch, heads, head_dim)  torch.float16  CUDA
+torch::Tensor int8_decode_attention_forward_torch(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
+    torch::Tensor scale_Q,
+    torch::Tensor scale_K,
+    torch::Tensor scale_V
+) {
+    TORCH_CHECK(Q.device().is_cuda(),      "Q must be a CUDA tensor");
+    TORCH_CHECK(Q.dtype() == torch::kInt8, "Q must be int8");
+    TORCH_CHECK(K.dtype() == torch::kInt8 && V.dtype() == torch::kInt8,
+                "K, V must be int8");
+    TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous(),
+                "Q/K/V must be contiguous");
+    TORCH_CHECK(Q.dim() == 3, "expected Q (batch, heads, head_dim) — seq_q == 1");
+    TORCH_CHECK(K.dim() == 4, "expected K (batch, heads, seq_kv, head_dim)");
+    TORCH_CHECK(K.sizes() == V.sizes(), "K/V shape mismatch");
+
+    const int batch    = Q.size(0);
+    const int heads    = Q.size(1);
+    const int head_dim = Q.size(2);
+    const int seq_kv   = K.size(2);
+    TORCH_CHECK(K.size(0) == batch && K.size(1) == heads && K.size(3) == head_dim,
+                "Q/K head/batch/dim mismatch");
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "decode kernel v1 supports head_dim 64 or 128");
+
+    const int BH = batch * heads;
+    auto sQ = scale_Q.contiguous().view({BH});
+    auto sK = scale_K.contiguous().view({BH * seq_kv});
+    auto sV = scale_V.contiguous().view({BH * seq_kv});
+
+    auto out = torch::empty({batch, heads, head_dim},
+                            torch::TensorOptions().dtype(torch::kFloat16).device(Q.device()));
+
+    int8_decode_attention_forward(
+        Q.data_ptr<int8_t>(), K.data_ptr<int8_t>(), V.data_ptr<int8_t>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        sQ.data_ptr<float>(), sK.data_ptr<float>(), sV.data_ptr<float>(),
+        BH, seq_kv, head_dim
+    );
     return out;
 }
 
@@ -331,6 +386,8 @@ std::tuple<torch::Tensor, double> int8_mlp_forward_prepacked_torch(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("int8_attention_forward", &int8_attention_forward_torch,
           "INT8 attention with per-token quantization (CUDA) — returns FP16");
+    m.def("int8_decode_attention_forward", &int8_decode_attention_forward_torch,
+          "INT8 flash-decoding attention (seq_q==1, INT8 KV cache) — returns FP16");
     // Two overloads: scalar scales (per-tensor) and tensor scales (per-token
     // activation + per-channel weight). pybind11 dispatches by argument type.
     m.def("int8_mlp_forward", &int8_mlp_forward_torch,
