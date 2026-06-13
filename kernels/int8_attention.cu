@@ -549,14 +549,25 @@ void int8_wmma_attention_kernel(
             pf[1] = attn_pack_half2(u0*sv0, u1*sv1);
             pf[2] = attn_pack_half2(w8*sv8, w9*sv9);
             pf[3] = attn_pack_half2(u8*sv8, u9*sv9);
+            // Software-pipelined P@V: prefetch slice s+1's V fragments via
+            // ldmatrix while slice s's two MMAs issue, so the ldmatrix smem→reg
+            // latency overlaps tensor-core work instead of stalling the next
+            // MMA. The B fragments of consecutive slices are independent (the
+            // shared A-weights pf are reused), so one extra live fragment set is
+            // all the pipeline needs. Targets tensor-pipe utilization — the MMAs
+            // were otherwise gated on each preceding ldmatrix.
+            const half* vbase = &s_V_fp16[(g * ATTN_WMMA_N + ld_row) * vs + ld_col];
+            uint32_t b0, b1, b2, b3;
+            attn_ldmatrix_x4_trans(b0, b1, b2, b3, vbase);
             #pragma unroll
             for (int s = 0; s < n_slices; ++s) {
-                uint32_t b0, b1, b2, b3;
-                attn_ldmatrix_x4_trans(b0, b1, b2, b3,
-                    &s_V_fp16[(g * ATTN_WMMA_N + ld_row) * vs
-                              + s * ATTN_WMMA_N + ld_col]);
+                uint32_t n0, n1, n2, n3;
+                if (s + 1 < n_slices)
+                    attn_ldmatrix_x4_trans(n0, n1, n2, n3,
+                        vbase + (s + 1) * ATTN_WMMA_N);
                 attn_mma_m16n8k16(&frag_out[s][0], pf, b0, b1);
                 attn_mma_m16n8k16(&frag_out[s][4], pf, b2, b3);
+                b0 = n0; b1 = n1; b2 = n2; b3 = n3;
             }
         }
 #else
