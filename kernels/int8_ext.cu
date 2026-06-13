@@ -49,6 +49,13 @@ void int8_mlp_forward_per_channel(
     int batch, int seq_len, int d_model, int d_ff
 );
 
+void int8_mlp_forward_per_channel_bias(
+    const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
+    const float* scale_x, const float* scale_W1, const float* scale_W2,
+    const float* gemm1_bias, float* out_row_scales,
+    int batch, int seq_len, int d_model, int d_ff
+);
+
 void transpose_int8_weights(
     const int8_t* W1, const int8_t* W2, int8_t* W1T, int8_t* W2T,
     int d_model, int d_ff
@@ -292,6 +299,71 @@ std::tuple<torch::Tensor, torch::Tensor> int8_mlp_forward_pc_torch(
     return {out, out_scale};
 }
 
+// Per-channel MLP with a per-channel PRE-GELU bias (b1, [d_ff]) added inside the
+// GEMM1 epilogue. Same returns as int8_mlp_forward_pc_torch: (out_int8,
+// out_scale[T]). The post-GEMM2 bias (b2) is the caller's responsibility in FP16
+// after dequant. For real-model end-to-end integration (e.g. GPT-2 c_fc bias).
+std::tuple<torch::Tensor, torch::Tensor> int8_mlp_forward_pc_bias_torch(
+    torch::Tensor x,
+    torch::Tensor W1,
+    torch::Tensor W2,
+    torch::Tensor scale_x,
+    torch::Tensor scale_W1,
+    torch::Tensor scale_W2,
+    torch::Tensor bias1
+) {
+    TORCH_CHECK(x.device().is_cuda(),           "x must be a CUDA tensor");
+    TORCH_CHECK(x.dtype()  == torch::kInt8,     "x must be int8");
+    TORCH_CHECK(W1.dtype() == torch::kInt8,     "W1 must be int8");
+    TORCH_CHECK(W2.dtype() == torch::kInt8,     "W2 must be int8");
+    TORCH_CHECK(x.is_contiguous(),              "x must be contiguous");
+    TORCH_CHECK(W1.is_contiguous(),             "W1 must be contiguous");
+    TORCH_CHECK(W2.is_contiguous(),             "W2 must be contiguous");
+    TORCH_CHECK(x.dim()  == 3, "x must be 3-D (batch, seq_len, d_model)");
+    TORCH_CHECK(W1.dim() == 2, "W1 must be 2-D (d_model, d_ff)");
+    TORCH_CHECK(W2.dim() == 2, "W2 must be 2-D (d_ff, d_model)");
+
+    const int batch   = x.size(0);
+    const int seq_len = x.size(1);
+    const int d_model = x.size(2);
+    const int d_ff    = W1.size(1);
+    const int T       = batch * seq_len;
+
+    TORCH_CHECK(W1.size(0) == d_model, "W1 shape mismatch");
+    TORCH_CHECK(W2.size(0) == d_ff,    "W2 shape mismatch");
+    TORCH_CHECK(W2.size(1) == d_model, "W2 shape mismatch");
+
+    auto check_scale = [](const torch::Tensor& s, int64_t n, const char* nm) {
+        TORCH_CHECK(s.dtype() == torch::kFloat32, nm, " must be float32");
+        TORCH_CHECK(s.device().is_cuda(),         nm, " must be CUDA");
+        TORCH_CHECK(s.numel() == n || s.numel() == 1,
+                    nm, " must have ", n, " (or 1) elements");
+    };
+    check_scale(scale_x,  T,       "scale_x");
+    check_scale(scale_W1, d_ff,    "scale_W1");
+    check_scale(scale_W2, d_model, "scale_W2");
+    TORCH_CHECK(bias1.dtype() == torch::kFloat32, "bias1 must be float32");
+    TORCH_CHECK(bias1.device().is_cuda(),         "bias1 must be CUDA");
+    TORCH_CHECK(bias1.numel() == d_ff,            "bias1 must have d_ff elements");
+
+    auto sx   = scale_x.contiguous();
+    auto sw1  = scale_W1.contiguous();
+    auto sw2  = scale_W2.contiguous();
+    auto b1   = bias1.contiguous();
+
+    auto out = torch::empty_like(x);
+    auto out_scale = torch::empty(
+        {T}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    int8_mlp_forward_per_channel_bias(
+        x.data_ptr<int8_t>(), W1.data_ptr<int8_t>(), W2.data_ptr<int8_t>(),
+        out.data_ptr<int8_t>(),
+        sx.data_ptr<float>(), sw1.data_ptr<float>(), sw2.data_ptr<float>(),
+        b1.data_ptr<float>(), out_scale.data_ptr<float>(),
+        batch, seq_len, d_model, d_ff);
+
+    return {out, out_scale};
+}
+
 // ── Weight pre-transpose (static-weight inference) ────────────────────
 // W1 : (d_model, d_ff)  int8  →  W1T : (d_ff, d_model)
 // W2 : (d_ff, d_model)  int8  →  W2T : (d_model, d_ff)
@@ -394,6 +466,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "INT8 MLP, per-tensor scales (CUDA) — returns (int8_out, out_scale)");
     m.def("int8_mlp_forward", &int8_mlp_forward_pc_torch,
           "INT8 MLP, per-token/per-channel scales (CUDA) — returns (int8_out, out_scale)");
+    m.def("int8_mlp_forward_per_channel_bias", &int8_mlp_forward_pc_bias_torch,
+          "INT8 MLP, per-token/per-channel scales + per-channel pre-GELU bias b1 "
+          "(CUDA) — returns (int8_out, out_scale)");
     // Static-weight inference: transpose weights once, then call prepacked.
     m.def("transpose_int8_weights", &transpose_int8_weights_torch,
           "Pre-transpose INT8 W1/W2 to [N][K] for the prepacked MLP path — "

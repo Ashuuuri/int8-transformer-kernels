@@ -310,10 +310,14 @@ __device__ __forceinline__ void mlp_int8_mainloop(
 }
 
 // ── INT8 WMMA GEMM → FP16 output (dynamic-quant building block) ────────
-// C (FP16) = dequant( A (INT8) × B (INT8) )   [+ GELU]
-//   real[i,j] = acc[i,j] * sA(i) * sB(j), where
+// C (FP16) = dequant( A (INT8) × B (INT8) )   [+ bias] [+ GELU]
+//   real[i,j] = acc[i,j] * sA(i) * sB(j) [+ d_bias[j]], where
 //     sA(i) = a_scale_per_row ? scale_A[row] : scale_A[0]   (per-token activ.)
 //     sB(j) = b_scale_per_col ? scale_B[col] : scale_B[0]   (per-channel weight)
+// apply_bias (default off) adds a per-output-column bias d_bias[N] BEFORE GELU —
+// this is the real-model GEMM1 c_fc bias (b1) the fused epilogue must host
+// because GELU sits between the matmul and the next op. Off-by-default keeps
+// every existing instantiation byte-identical.
 // Per-row A and per-col B scale tables are staged once into smem (s_arow /
 // s_bcol) so the epilogue indexes them conflict-free; s_rowstat is then used
 // solely as the GEMM1 per-row absmax accumulator (no longer doubles as a
@@ -326,7 +330,8 @@ __device__ __forceinline__ void mlp_int8_mainloop(
 // launch_bounds caps registers at 128 (= 2 blocks/SM with 256 threads);
 // without it the epilogue statistics push the kernel to 166 regs, which
 // halves occupancy and costs ~35% end-to-end.
-template <bool apply_gelu, bool a_scale_per_row, bool b_scale_per_col>
+template <bool apply_gelu, bool a_scale_per_row, bool b_scale_per_col,
+          bool apply_bias = false>
 __global__ __launch_bounds__(THREADS_PER_BLOCK, 2)
 void gemm_int8_wmma_f16_kernel(
     const int8_t* __restrict__ A,
@@ -336,7 +341,8 @@ void gemm_int8_wmma_f16_kernel(
     const float* __restrict__ d_scale_A,
     const float* __restrict__ d_scale_B,
     float* __restrict__ d_row_absmax,
-    float* __restrict__ d_out_absmax
+    float* __restrict__ d_out_absmax,
+    const float* __restrict__ d_bias = nullptr
 ) {
     // Scalar fallbacks (used only when the matching per-row/per-col flag is off).
     const float scaleA0 = a_scale_per_row ? 0.f : __ldg(d_scale_A);
@@ -379,6 +385,7 @@ void gemm_int8_wmma_f16_kernel(
     // s_rowstat is now ONLY the GEMM1 per-row |C| absmax accumulator.
     __shared__ float s_arow[BLOCK_M];      // d_scale_A[block_m + i]
     __shared__ float s_bcol[BLOCK_N];      // d_scale_B[block_n + i]
+    __shared__ float s_bias[apply_bias ? BLOCK_N : 1];  // d_bias[block_n + i]
     __shared__ float s_rowstat[BLOCK_M];
     __shared__ float s_outmax;
     if (a_scale_per_row)
@@ -387,12 +394,15 @@ void gemm_int8_wmma_f16_kernel(
     if (b_scale_per_col)
         for (int i = threadIdx.x; i < BLOCK_N; i += THREADS_PER_BLOCK)
             s_bcol[i] = __ldg(&d_scale_B[block_n + i]);
+    if (apply_bias)
+        for (int i = threadIdx.x; i < BLOCK_N; i += THREADS_PER_BLOCK)
+            s_bias[i] = __ldg(&d_bias[block_n + i]);
     if (d_row_absmax != nullptr)
         for (int i = threadIdx.x; i < BLOCK_M; i += THREADS_PER_BLOCK)
             s_rowstat[i] = 0.f;
     if (d_out_absmax != nullptr && threadIdx.x == 0)
         s_outmax = 0.f;
-    if (a_scale_per_row || b_scale_per_col ||
+    if (a_scale_per_row || b_scale_per_col || apply_bias ||
         d_row_absmax != nullptr || d_out_absmax != nullptr)
         __syncthreads();
 
@@ -429,6 +439,7 @@ void gemm_int8_wmma_f16_kernel(
                 const float sb = b_scale_per_col ? s_bcol[btile_col + c]
                                                  : scaleB0;
                 float v = (float)cp[i] * sa * sb;
+                if (apply_bias) v += s_bias[btile_col + c];   // b1, before GELU
                 if (apply_gelu) v = int8_gelu(v);
                 C[(row_base + r) * N + (tile_col + c)] = __float2half_rn(v);
                 if (d_row_absmax != nullptr)
@@ -990,7 +1001,8 @@ static void int8_mlp_forward_impl(
     const float* scale_x, const float* scale_W1, const float* scale_W2,
     int batch, int seq_len, int d_model, int d_ff,
     bool x_per_token, bool w_per_channel, float* out_row_scales,
-    bool weights_prepacked = false
+    bool weights_prepacked = false,
+    const float* gemm1_bias = nullptr
 ) {
     const int T = batch * seq_len;
 
@@ -1071,14 +1083,23 @@ static void int8_mlp_forward_impl(
         // actually used (per-tensor: <true,false,false>; per-channel:
         // <true,true,true>).
         dim3 grid1(d_ff / BLOCK_N, T / BLOCK_M);
-        if (x_per_token && w_per_channel)
-            gemm_int8_wmma_f16_kernel<true, true, true><<<grid1, THREADS_PER_BLOCK>>>(
-                x, W1T, s_hidden_f16, T, d_ff, d_model,
-                scale_x, scale_W1, s_row_absmax, nullptr);
-        else
+        if (x_per_token && w_per_channel) {
+            // Optional per-channel pre-GELU bias (b1, the GPT-2 c_fc bias): the
+            // fused epilogue adds it before GELU. apply_bias is compile-time, so
+            // dispatch on whether a bias was supplied.
+            if (gemm1_bias)
+                gemm_int8_wmma_f16_kernel<true, true, true, true><<<grid1, THREADS_PER_BLOCK>>>(
+                    x, W1T, s_hidden_f16, T, d_ff, d_model,
+                    scale_x, scale_W1, s_row_absmax, nullptr, gemm1_bias);
+            else
+                gemm_int8_wmma_f16_kernel<true, true, true><<<grid1, THREADS_PER_BLOCK>>>(
+                    x, W1T, s_hidden_f16, T, d_ff, d_model,
+                    scale_x, scale_W1, s_row_absmax, nullptr);
+        } else {
             gemm_int8_wmma_f16_kernel<true, false, false><<<grid1, THREADS_PER_BLOCK>>>(
                 x, W1T, s_hidden_f16, T, d_ff, d_model,
                 scale_x, scale_W1, s_row_absmax, nullptr);
+        }
 
         dim3 grid2(d_model / BLOCK_N, T / BLOCK_M);
 #if INT8_MLP_FUSE_QUANT
@@ -1234,6 +1255,27 @@ void int8_mlp_forward_per_channel(
                           batch, seq_len, d_model, d_ff,
                           /*x_per_token=*/true, /*w_per_channel=*/true,
                           out_row_scales);
+}
+
+// Same as int8_mlp_forward_per_channel, plus a per-channel PRE-GELU bias
+// (gemm1_bias, [d_ff]) added in the GEMM1 epilogue before GELU — this is the
+// GPT-2 c_fc bias (b1), which the fused GELU epilogue cannot otherwise host.
+// The post-GEMM2 bias (GPT-2 c_proj b2) stays in FP16 at the caller, after
+// dequant, matching the validate_int8.py simulation. gemm1_bias may be nullptr
+// (then identical to int8_mlp_forward_per_channel). For real-model end-to-end
+// integration / Gate-5-faithful perplexity with the actual kernel.
+void int8_mlp_forward_per_channel_bias(
+    const int8_t* x, const int8_t* W1, const int8_t* W2, int8_t* out,
+    const float* scale_x, const float* scale_W1, const float* scale_W2,
+    const float* gemm1_bias, float* out_row_scales,
+    int batch, int seq_len, int d_model, int d_ff
+) {
+    int8_mlp_forward_impl(x, W1, W2, out, scale_x, scale_W1, scale_W2,
+                          batch, seq_len, d_model, d_ff,
+                          /*x_per_token=*/true, /*w_per_channel=*/true,
+                          out_row_scales,
+                          /*weights_prepacked=*/false,
+                          /*gemm1_bias=*/gemm1_bias);
 }
 
 // Transpose the INT8 weights ONCE into caller-owned [N][K] buffers
