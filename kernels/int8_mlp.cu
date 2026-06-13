@@ -58,11 +58,63 @@ __device__ __forceinline__ void atomic_max_pos_f32(float* addr, float val) {
 // INT8 smem padding: 16 bytes per row
 #define SMEM_SKEW        16
 #define A_SMEM_STRIDE    (STAGE_K + SMEM_SKEW)                  // 48
-#define B_SMEM_STRIDE    (BLOCK_N + SMEM_SKEW)                  // 144
+// B is staged TRANSPOSED ([n][k], k contiguous) so the hand-rolled m16n8k32
+// b-fragment load is a single 4-byte word per register (same access pattern
+// as A).  With this stride the per-instruction bank map (12*group + tid_grp)
+// mod 32 is a bijection over the 32 lanes → conflict-free, unlike the WMMA
+// load_matrix_sync path it replaces.
+#define B_SMEM_STRIDE    (STAGE_K + SMEM_SKEW)                  // 48
 
 // cp.async: 16 bytes per copy = 16 INT8 elements
 #define A_COPIES_PER_ROW (STAGE_K / 16)                         // 2
-#define B_COPIES_PER_ROW (BLOCK_N / 16)                         // 8
+#define B_COPIES_PER_ROW (STAGE_K / 16)                         // 2 (per n-row)
+
+// ── Native INT8 mma.sync m16n8k32 (mirrors attention's QK^T path) ───────
+// D[m16,n8] s32 += A[m16,k32] s8 · B[k32,n8] s8.  A row-major (k contiguous),
+// B column-major (k contiguous) — both fed from k-contiguous smem tiles, so
+// every operand register is a single 4-byte smem word.
+__device__ __forceinline__ void mlp_mma_m16n8k32_s8(
+    int32_t* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Scatter a warp's two-n8 (16x16) s32 accumulator into a row-major smem tile,
+// reproducing the WMMA store_matrix_sync layout the epilogue reads back.
+//   a8[0..3] = low  n8 (cols 0..7):  c0/c1 rows g, c2/c3 rows g+8
+//   a8[4..7] = high n8 (cols 8..15)
+__device__ __forceinline__ void mlp_store_acc16(
+    int32_t* tile, const int32_t* a8, int lane) {
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    tile[(g    ) * 16 + (2 * t    )]     = a8[0];
+    tile[(g    ) * 16 + (2 * t + 1)]     = a8[1];
+    tile[(g + 8) * 16 + (2 * t    )]     = a8[2];
+    tile[(g + 8) * 16 + (2 * t + 1)]     = a8[3];
+    tile[(g    ) * 16 + 8 + (2 * t    )] = a8[4];
+    tile[(g    ) * 16 + 8 + (2 * t + 1)] = a8[5];
+    tile[(g + 8) * 16 + 8 + (2 * t    )] = a8[6];
+    tile[(g + 8) * 16 + 8 + (2 * t + 1)] = a8[7];
+}
+
+// Transpose an INT8 [K][N] matrix to [N][K] (k contiguous) so the GEMM B
+// operand can be staged k-contiguous for the m16n8k32 b-fragment loads.
+// Weights are constant per forward; the cost is a one-shot bandwidth pass.
+__global__ void transpose_int8_kernel(
+    const int8_t* __restrict__ in, int8_t* __restrict__ out, int K, int N) {
+    __shared__ int8_t tile[32][33];
+    const int n = blockIdx.x * 32 + threadIdx.x;
+    const int k = blockIdx.y * 32 + threadIdx.y;
+    if (n < N && k < K) tile[threadIdx.y][threadIdx.x] = in[(size_t)k * N + n];
+    __syncthreads();
+    const int k2 = blockIdx.y * 32 + threadIdx.x;
+    const int n2 = blockIdx.x * 32 + threadIdx.y;
+    if (k2 < K && n2 < N) out[(size_t)n2 * K + k2] = tile[threadIdx.x][threadIdx.y];
+}
 
 // ── Scalar fallback ────────────────────────────────────────────────────
 // Accumulates INT8 products as float, writes FP16 output.
@@ -102,32 +154,110 @@ __global__ void gemm_int8_scalar_kernel(
 }
 
 // ── Async tile loader (INT8 double-buffer) ─────────────────────────────
-// Loads one BLOCK_M×STAGE_K slab of A and one STAGE_K×BLOCK_N slab of B
-// into shared memory via cp.async.  Only called when dimensions are multiples
-// of the tile sizes (enforced by the use_wmma check in int8_mlp_forward).
+// Loads one BLOCK_M×STAGE_K slab of A ([m][k]) and one BLOCK_N×STAGE_K slab of
+// the TRANSPOSED B ([n][k], k contiguous) into shared memory via cp.async.
+// Only called when dimensions are multiples of the tile sizes (enforced by the
+// use_wmma check in int8_mlp_forward).
 __device__ __forceinline__ void load_int8_tile_async(
     const int8_t* __restrict__ A,
-    const int8_t* __restrict__ B,
+    const int8_t* __restrict__ BT,
     int8_t* sA, int8_t* sB,
     int block_m, int block_n, int k0, int K, int N
 ) {
-    const int A_COPIES = BLOCK_M * A_COPIES_PER_ROW;    // 256
-    const int B_COPIES = STAGE_K * B_COPIES_PER_ROW;    // 256
+    (void)N;
+    const int A_COPIES = BLOCK_M * A_COPIES_PER_ROW;    // 256  (128 m-rows × 2)
+    const int B_COPIES = BLOCK_N * B_COPIES_PER_ROW;    // 256  (128 n-rows × 2)
     const int TOTAL    = A_COPIES + B_COPIES;            // 512
 
     for (int c = threadIdx.x; c < TOTAL; c += THREADS_PER_BLOCK) {
         if (c < A_COPIES) {
-            const int row = c / A_COPIES_PER_ROW;
-            const int col = (c % A_COPIES_PER_ROW) * 16;
+            const int row = c / A_COPIES_PER_ROW;        // m row 0..127
+            const int col = (c % A_COPIES_PER_ROW) * 16; // k offset
             i8_cp_async_16B(sA + row * A_SMEM_STRIDE + col,
                             A  + (block_m + row) * K + k0 + col);
         } else {
             const int bc  = c - A_COPIES;
-            const int row = bc / B_COPIES_PER_ROW;
-            const int col = (bc % B_COPIES_PER_ROW) * 16;
+            const int row = bc / B_COPIES_PER_ROW;        // n row 0..127
+            const int col = (bc % B_COPIES_PER_ROW) * 16; // k offset
             i8_cp_async_16B(sB + row * B_SMEM_STRIDE + col,
-                            B  + (k0 + row) * N + block_n + col);
+                            BT + (block_n + row) * K + k0 + col);
         }
+    }
+}
+
+// ── INT8 m16n8k32 main loop (shared by both GEMM epilogue kernels) ──────
+// Fills acc[WARP_ROW_TILES][WARP_COL_TILES][8] (s32) for this warp's
+// 32×64 output sub-tile, with k-contiguous double-buffered cp.async staging.
+// Each 16-wide col tile = two n8 mma.sync calls → acc[..][0..3]/[4..7], the
+// same element order WMMA store_matrix_sync produced (mlp_store_acc16 mirrors
+// it), so the kernel epilogues are unchanged.
+__device__ __forceinline__ void mlp_int8_mainloop(
+    const int8_t* __restrict__ A,
+    const int8_t* __restrict__ BT,
+    int8_t* sA0, int8_t* sA1, int8_t* sB0, int8_t* sB1,
+    int M, int N, int K, int block_m, int block_n,
+    int warp_m, int warp_ng, int lane,
+    int32_t acc[WARP_ROW_TILES][WARP_COL_TILES][8]
+) {
+    (void)M;
+    int8_t* sA[2] = {sA0, sA1};
+    int8_t* sB[2] = {sB0, sB1};
+
+    #pragma unroll
+    for (int rt = 0; rt < WARP_ROW_TILES; rt++)
+        #pragma unroll
+        for (int ct = 0; ct < WARP_COL_TILES; ct++)
+            #pragma unroll
+            for (int e = 0; e < 8; e++) acc[rt][ct][e] = 0;
+
+    const int groupID = lane >> 2;     // 0..7
+    const int tid_grp = lane & 3;      // 0..3
+
+    int stage = 0;
+    load_int8_tile_async(A, BT, sA[0], sB[0], block_m, block_n, 0, K, N);
+    i8_cp_async_commit();
+
+    for (int k0 = 0; k0 < K; k0 += STAGE_K) {
+        i8_cp_async_wait_all();
+        __syncthreads();
+
+        const int next_k0 = k0 + STAGE_K;
+        const int next_s  = stage ^ 1;
+        if (next_k0 < K) {
+            load_int8_tile_async(A, BT, sA[next_s], sB[next_s],
+                                 block_m, block_n, next_k0, K, N);
+            i8_cp_async_commit();
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < STAGE_K; kk += 32) {
+            #pragma unroll
+            for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
+                const int8_t* ar0 = sA[stage]
+                    + ((warp_m * WARP_ROW_TILES + rt) * WMMA_M + groupID) * A_SMEM_STRIDE;
+                const int8_t* ar8 = ar0 + 8 * A_SMEM_STRIDE;
+                const int ka = kk + tid_grp * 4;
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(ar0 + ka);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(ar8 + ka);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(ar0 + ka + 16);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(ar8 + ka + 16);
+                #pragma unroll
+                for (int ct = 0; ct < WARP_COL_TILES; ct++) {
+                    const int colbase = (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
+                    const int8_t* bl = sB[stage] + (colbase + groupID) * B_SMEM_STRIDE;
+                    const int8_t* bh = bl + 8 * B_SMEM_STRIDE;   // high n8 (cols 8..15)
+                    const uint32_t b0l = *reinterpret_cast<const uint32_t*>(bl + ka);
+                    const uint32_t b1l = *reinterpret_cast<const uint32_t*>(bl + ka + 16);
+                    const uint32_t b0h = *reinterpret_cast<const uint32_t*>(bh + ka);
+                    const uint32_t b1h = *reinterpret_cast<const uint32_t*>(bh + ka + 16);
+                    mlp_mma_m16n8k32_s8(&acc[rt][ct][0], a0, a1, a2, a3, b0l, b1l);
+                    mlp_mma_m16n8k32_s8(&acc[rt][ct][4], a0, a1, a2, a3, b0h, b1h);
+                }
+            }
+        }
+
+        __syncthreads();
+        stage = next_s;
     }
 }
 
@@ -147,7 +277,7 @@ template <bool apply_gelu, bool a_scale_per_row>
 __global__ __launch_bounds__(THREADS_PER_BLOCK, 2)
 void gemm_int8_wmma_f16_kernel(
     const int8_t* __restrict__ A,
-    const int8_t* __restrict__ B,
+    const int8_t* __restrict__ BT,
     half* __restrict__         C,
     int M, int N, int K,
     const float* __restrict__ d_scale_A,
@@ -159,18 +289,18 @@ void gemm_int8_wmma_f16_kernel(
     const float scale = a_scale_per_row ? 0.f : __ldg(d_scale_A) * scale_B;
 
     // sA/sB (K-loop) and c_smem (epilogue) are temporally disjoint — overlap them.
-    // K-loop: 2×(128×48) + 2×(32×144) = 21504 B
-    // Epilogue: 8×4×256×4              = 32768 B
-    // Overlapped: max(21504, 32768)    = 32768 B  < 48KB static limit
-    constexpr int SMEM_AB   = 2 * BLOCK_M * A_SMEM_STRIDE + 2 * STAGE_K * B_SMEM_STRIDE;
+    // K-loop: 2×(128×48) A + 2×(128×48) B = 24576 B
+    // Epilogue: 8×4×256×4                 = 32768 B
+    // Overlapped: max(24576, 32768)       = 32768 B  < 48KB static limit
+    constexpr int SMEM_AB   = 2 * BLOCK_M * A_SMEM_STRIDE + 2 * BLOCK_N * B_SMEM_STRIDE;
     constexpr int SMEM_EPIL = WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N * (int)sizeof(int32_t);
     constexpr int SMEM_SIZE = SMEM_AB > SMEM_EPIL ? SMEM_AB : SMEM_EPIL;
     __shared__ __align__(16) char _smem[SMEM_SIZE];
 
-    int8_t* sA[2] = {(int8_t*)_smem,
-                      (int8_t*)_smem + BLOCK_M * A_SMEM_STRIDE};
-    int8_t* sB[2] = {(int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE,
-                      (int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE + STAGE_K * B_SMEM_STRIDE};
+    int8_t* sA0 = (int8_t*)_smem;
+    int8_t* sA1 = sA0 + BLOCK_M * A_SMEM_STRIDE;
+    int8_t* sB0 = sA0 + 2 * BLOCK_M * A_SMEM_STRIDE;
+    int8_t* sB1 = sB0 + BLOCK_N * B_SMEM_STRIDE;
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -180,58 +310,10 @@ void gemm_int8_wmma_f16_kernel(
     const int block_m = blockIdx.y * BLOCK_M;
     const int block_n = blockIdx.x * BLOCK_N;
 
-    // Fragments: 2 row tiles × 4 col tiles per warp = 8 MMAs per K-step
-    wmma::fragment<wmma::matrix_a,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag[WARP_ROW_TILES];
-    wmma::fragment<wmma::matrix_b,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> b_frag[WARP_COL_TILES];
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc[WARP_ROW_TILES][WARP_COL_TILES];
-
-    #pragma unroll
-    for (int rt = 0; rt < WARP_ROW_TILES; rt++)
-        #pragma unroll
-        for (int ct = 0; ct < WARP_COL_TILES; ct++)
-            wmma::fill_fragment(acc[rt][ct], (int32_t)0);
-
-    // Double-buffered K-loop
-    int stage = 0;
-    load_int8_tile_async(A, B, sA[0], sB[0], block_m, block_n, 0, K, N);
-    i8_cp_async_commit();
-
-    for (int k0 = 0; k0 < K; k0 += STAGE_K) {
-        i8_cp_async_wait_all();
-        __syncthreads();
-
-        const int next_k0 = k0 + STAGE_K;
-        const int next_s  = stage ^ 1;
-        if (next_k0 < K) {
-            load_int8_tile_async(A, B, sA[next_s], sB[next_s],
-                                 block_m, block_n, next_k0, K, N);
-            i8_cp_async_commit();
-        }
-
-        #pragma unroll
-        for (int kk = 0; kk < STAGE_K; kk += WMMA_K) {
-            #pragma unroll
-            for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
-                const int8_t* a_ptr = sA[stage]
-                    + (warp_m * WARP_ROW_TILES + rt) * WMMA_M * A_SMEM_STRIDE + kk;
-                wmma::load_matrix_sync(a_frag[rt], a_ptr, A_SMEM_STRIDE);
-            }
-            #pragma unroll
-            for (int ct = 0; ct < WARP_COL_TILES; ct++) {
-                const int8_t* b_ptr = sB[stage]
-                    + kk * B_SMEM_STRIDE + (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
-                wmma::load_matrix_sync(b_frag[ct], b_ptr, B_SMEM_STRIDE);
-            }
-            #pragma unroll
-            for (int rt = 0; rt < WARP_ROW_TILES; rt++)
-                #pragma unroll
-                for (int ct = 0; ct < WARP_COL_TILES; ct++)
-                    wmma::mma_sync(acc[rt][ct], a_frag[rt], b_frag[ct], acc[rt][ct]);
-        }
-
-        __syncthreads();
-        stage = next_s;
-    }
+    int32_t acc[WARP_ROW_TILES][WARP_COL_TILES][8];
+    mlp_int8_mainloop(A, BT, sA0, sA1, sB0, sB1,
+                      M, N, K, block_m, block_n,
+                      warp_m, warp_ng, lane_id, acc);
 
     // Epilogue: INT32 → float → ×scale → [GELU] → FP16 (+ absmax statistics)
     // sA/sB no longer needed — repurpose _smem as c_smem
@@ -260,8 +342,7 @@ void gemm_int8_wmma_f16_kernel(
     for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
         #pragma unroll
         for (int ct = 0; ct < WARP_COL_TILES; ct++)
-            wmma::store_matrix_sync(c_base + ct * WMMA_M * WMMA_N,
-                                    acc[rt][ct], WMMA_N, wmma::mem_row_major);
+            mlp_store_acc16(c_base + ct * WMMA_M * WMMA_N, acc[rt][ct], lane_id);
         __syncwarp();
 
         const int row_base = block_m + (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
@@ -415,7 +496,7 @@ __global__ void compute_static_scales_kernel(
 template <bool apply_gelu>
 __global__ void gemm_int8_wmma_i8_kernel(
     const int8_t* __restrict__ A,
-    const int8_t* __restrict__ B,
+    const int8_t* __restrict__ BT,
     int8_t* __restrict__       C,
     int M, int N, int K,
     const float* __restrict__ d_scale_A,
@@ -426,15 +507,15 @@ __global__ void gemm_int8_wmma_i8_kernel(
     const float inv_scale = __ldg(d_inv_scale_out);
 
     // sA/sB (K-loop) and c_smem (epilogue) are temporally disjoint — overlap them.
-    constexpr int SMEM_AB   = 2 * BLOCK_M * A_SMEM_STRIDE + 2 * STAGE_K * B_SMEM_STRIDE;
+    constexpr int SMEM_AB   = 2 * BLOCK_M * A_SMEM_STRIDE + 2 * BLOCK_N * B_SMEM_STRIDE;
     constexpr int SMEM_EPIL = WARPS_PER_BLOCK * WARP_COL_TILES * WMMA_M * WMMA_N * (int)sizeof(int32_t);
     constexpr int SMEM_SIZE = SMEM_AB > SMEM_EPIL ? SMEM_AB : SMEM_EPIL;
     __shared__ __align__(16) char _smem[SMEM_SIZE];
 
-    int8_t* sA[2] = {(int8_t*)_smem,
-                      (int8_t*)_smem + BLOCK_M * A_SMEM_STRIDE};
-    int8_t* sB[2] = {(int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE,
-                      (int8_t*)_smem + 2 * BLOCK_M * A_SMEM_STRIDE + STAGE_K * B_SMEM_STRIDE};
+    int8_t* sA0 = (int8_t*)_smem;
+    int8_t* sA1 = sA0 + BLOCK_M * A_SMEM_STRIDE;
+    int8_t* sB0 = sA0 + 2 * BLOCK_M * A_SMEM_STRIDE;
+    int8_t* sB1 = sB0 + BLOCK_N * B_SMEM_STRIDE;
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -444,53 +525,10 @@ __global__ void gemm_int8_wmma_i8_kernel(
     const int block_m = blockIdx.y * BLOCK_M;
     const int block_n = blockIdx.x * BLOCK_N;
 
-    wmma::fragment<wmma::matrix_a,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> a_frag[WARP_ROW_TILES];
-    wmma::fragment<wmma::matrix_b,    WMMA_M, WMMA_N, WMMA_K, int8_t, wmma::row_major> b_frag[WARP_COL_TILES];
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int32_t> acc[WARP_ROW_TILES][WARP_COL_TILES];
-
-    #pragma unroll
-    for (int rt = 0; rt < WARP_ROW_TILES; rt++)
-        #pragma unroll
-        for (int ct = 0; ct < WARP_COL_TILES; ct++)
-            wmma::fill_fragment(acc[rt][ct], (int32_t)0);
-
-    int stage = 0;
-    load_int8_tile_async(A, B, sA[0], sB[0], block_m, block_n, 0, K, N);
-    i8_cp_async_commit();
-
-    for (int k0 = 0; k0 < K; k0 += STAGE_K) {
-        i8_cp_async_wait_all();
-        __syncthreads();
-        const int next_k0 = k0 + STAGE_K;
-        const int next_s  = stage ^ 1;
-        if (next_k0 < K) {
-            load_int8_tile_async(A, B, sA[next_s], sB[next_s],
-                                 block_m, block_n, next_k0, K, N);
-            i8_cp_async_commit();
-        }
-        #pragma unroll
-        for (int kk = 0; kk < STAGE_K; kk += WMMA_K) {
-            #pragma unroll
-            for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
-                const int8_t* a_ptr = sA[stage]
-                    + (warp_m * WARP_ROW_TILES + rt) * WMMA_M * A_SMEM_STRIDE + kk;
-                wmma::load_matrix_sync(a_frag[rt], a_ptr, A_SMEM_STRIDE);
-            }
-            #pragma unroll
-            for (int ct = 0; ct < WARP_COL_TILES; ct++) {
-                const int8_t* b_ptr = sB[stage]
-                    + kk * B_SMEM_STRIDE + (warp_ng * WARP_COL_TILES + ct) * WMMA_N;
-                wmma::load_matrix_sync(b_frag[ct], b_ptr, B_SMEM_STRIDE);
-            }
-            #pragma unroll
-            for (int rt = 0; rt < WARP_ROW_TILES; rt++)
-                #pragma unroll
-                for (int ct = 0; ct < WARP_COL_TILES; ct++)
-                    wmma::mma_sync(acc[rt][ct], a_frag[rt], b_frag[ct], acc[rt][ct]);
-        }
-        __syncthreads();
-        stage = next_s;
-    }
+    int32_t acc[WARP_ROW_TILES][WARP_COL_TILES][8];
+    mlp_int8_mainloop(A, BT, sA0, sA1, sB0, sB1,
+                      M, N, K, block_m, block_n,
+                      warp_m, warp_ng, lane_id, acc);
 
     // Epilogue: INT32 → float → ×scale → [GELU] → INT8
     // sA/sB no longer needed — repurpose _smem as c_smem
@@ -501,8 +539,7 @@ __global__ void gemm_int8_wmma_i8_kernel(
     for (int rt = 0; rt < WARP_ROW_TILES; rt++) {
         #pragma unroll
         for (int ct = 0; ct < WARP_COL_TILES; ct++)
-            wmma::store_matrix_sync(c_base + ct * WMMA_M * WMMA_N,
-                                    acc[rt][ct], WMMA_N, wmma::mem_row_major);
+            mlp_store_acc16(c_base + ct * WMMA_M * WMMA_N, acc[rt][ct], lane_id);
         __syncwarp();
 
         const int row_base = block_m + (warp_m * WARP_ROW_TILES + rt) * WMMA_M;
@@ -569,6 +606,13 @@ static float*  s_scale_out        = nullptr;
 static float*  s_inv_scale_out    = nullptr;
 static size_t  s_hidden_cap       = 0;
 
+// Transposed weights ([N][K], k contiguous) for the m16n8k32 b-fragment loads.
+// Re-transposed every forward — pointer-keyed caching would alias across
+// validation datasets that reuse freed weight addresses.
+static int8_t* s_w1t              = nullptr;   // W1^T  ([d_ff][d_model])
+static int8_t* s_w2t              = nullptr;   // W2^T  ([d_model][d_ff])
+static size_t  s_wt_cap           = 0;
+
 #if INT8_MLP_DYNAMIC
 static half*   s_hidden_f16  = nullptr;   // FP16 hidden (pre-quantization)
 static half*   s_out_f16     = nullptr;   // FP16 output (pre-quantization)
@@ -610,6 +654,29 @@ void int8_mlp_forward(
         (d_ff   % BLOCK_N == 0) && (d_model % STAGE_K == 0) &&
         (d_ff   % STAGE_K == 0);
 
+    // The m16n8k32 GEMM needs its B operand (the weights) staged k-contiguous,
+    // so pre-transpose W1 ([d_model][d_ff]→[d_ff][d_model]) and W2
+    // ([d_ff][d_model]→[d_model][d_ff]) into [N][K] buffers. Weights are
+    // constant per forward; this is a one-shot bandwidth pass (~1-2% of GEMM).
+    const int8_t* W1T = W1;
+    const int8_t* W2T = W2;
+    if (use_wmma) {
+        const size_t wt_sz = (size_t)d_model * d_ff * sizeof(int8_t);
+        if (wt_sz > s_wt_cap) {
+            cudaFree(s_w1t);  cudaFree(s_w2t);
+            cudaMalloc(&s_w1t, wt_sz);
+            cudaMalloc(&s_w2t, wt_sz);
+            s_wt_cap = wt_sz;
+        }
+        const dim3 tb(32, 32);
+        transpose_int8_kernel<<<dim3((d_ff + 31) / 32, (d_model + 31) / 32), tb>>>(
+            W1, s_w1t, d_model, d_ff);   // [d_model][d_ff] -> [d_ff][d_model]
+        transpose_int8_kernel<<<dim3((d_model + 31) / 32, (d_ff + 31) / 32), tb>>>(
+            W2, s_w2t, d_ff, d_model);   // [d_ff][d_model] -> [d_model][d_ff]
+        W1T = s_w1t;
+        W2T = s_w2t;
+    }
+
 #if INT8_MLP_DYNAMIC
     // ── Dynamic quantization path ───────────────────────────────────────
     // GEMM1 → FP16 hidden + per-row absmax → per-token INT8 requant →
@@ -640,7 +707,7 @@ void int8_mlp_forward(
 
         dim3 grid1(d_ff / BLOCK_N, T / BLOCK_M);
         gemm_int8_wmma_f16_kernel<true, false><<<grid1, THREADS_PER_BLOCK>>>(
-            x, W1, s_hidden_f16, T, d_ff, d_model,
+            x, W1T, s_hidden_f16, T, d_ff, d_model,
             scale_x, scale_W1, s_row_absmax, nullptr);
 
         const size_t h_vecs = (size_t)T * d_ff / 8;
@@ -651,7 +718,7 @@ void int8_mlp_forward(
 
         dim3 grid2(d_model / BLOCK_N, T / BLOCK_M);
         gemm_int8_wmma_f16_kernel<false, true><<<grid2, THREADS_PER_BLOCK>>>(
-            s_hidden_int8, W2, s_out_f16, T, d_model, d_ff,
+            s_hidden_int8, W2T, s_out_f16, T, d_model, d_ff,
             s_row_scales, scale_W2, nullptr, s_out_absmax);
 
         const size_t o_elems = (size_t)T * d_model;
@@ -674,7 +741,7 @@ void int8_mlp_forward(
     if (use_wmma) {
         dim3 grid(d_ff / BLOCK_N, T / BLOCK_M);
         gemm_int8_wmma_i8_kernel<true><<<grid, THREADS_PER_BLOCK>>>(
-            x, W1, s_hidden_int8, T, d_ff, d_model,
+            x, W1T, s_hidden_int8, T, d_ff, d_model,
             scale_x, scale_W1, s_inv_scale_hidden);
     } else {
         dim3 grid((d_ff + SCALAR_TILE-1)/SCALAR_TILE, (T + SCALAR_TILE-1)/SCALAR_TILE);
@@ -687,7 +754,7 @@ void int8_mlp_forward(
     if (use_wmma) {
         dim3 grid(d_model / BLOCK_N, T / BLOCK_M);
         gemm_int8_wmma_i8_kernel<false><<<grid, THREADS_PER_BLOCK>>>(
-            s_hidden_int8, W2, out, T, d_model, d_ff,
+            s_hidden_int8, W2T, out, T, d_model, d_ff,
             s_scale_hidden, scale_W2, s_inv_scale_out);
     } else {
         dim3 grid((d_model + SCALAR_TILE-1)/SCALAR_TILE, (T + SCALAR_TILE-1)/SCALAR_TILE);
