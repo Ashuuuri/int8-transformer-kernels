@@ -12,8 +12,8 @@ import sys
 import numpy as np
 import torch
 
-# Add project root to path so we can import baseline
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Add common/ (shared primitives) to path so we can import baseline
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 from baseline import attention_baseline, mlp_baseline, check_cuda
 
 

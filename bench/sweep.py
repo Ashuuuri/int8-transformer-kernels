@@ -33,8 +33,8 @@ import time
 import torch
 from torch.utils.cpp_extension import load
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ROOT)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (one up from bench/)
+sys.path.insert(0, os.path.join(ROOT, "common"))
 
 from baseline import attention_baseline, mlp_baseline, check_cuda
 from benchmark import benchmark

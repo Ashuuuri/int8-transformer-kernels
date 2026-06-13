@@ -72,14 +72,14 @@ compile_check() {  # syntax + ptxas check of both INT8 kernels
 # build. Returns 0 only if ncu metric data was written (1 if sudo/ncu absent).
 run_ncu() {  # run_ncu <outfile>
     local out="$1"
-    python3 profile_kernel.py both > /dev/null 2>&1     # pre-warm JIT cache
+    python3 bench/profile_kernel.py both > /dev/null 2>&1     # pre-warm JIT cache
     sudo -n true 2>/dev/null && command -v ncu >/dev/null || return 1
     # env PATH/HOME: keep the user's JIT cache + ninja visible under sudo,
     # otherwise root rebuilds the extension inside the profiler (or fails).
     sudo env "PATH=$PATH" HOME="$HOME" \
         ncu --kernel-name regex:int8_wmma --launch-count 2 \
         --metrics "$NCU_METRICS" \
-        python3 profile_kernel.py attn 2>&1 \
+        python3 bench/profile_kernel.py attn 2>&1 \
         | grep -E "int8_|Metric Name|----|pct|registers|wavefronts|occupancy|maximum_warps" \
         > "$out"
     grep -q "registers" "$out" 2>/dev/null
@@ -131,7 +131,7 @@ median_sweep() {  # median_sweep <int8_attn|int8_mlp> <logprefix>
     local kernel="$1" logpfx="$2" r
     local -a csvs=()
     for r in $(seq 1 "$SWEEP_REPS"); do
-        python3 sweep.py --kernel "$kernel" > "${logpfx}_$r.log" 2>&1 || return 1
+        python3 bench/sweep.py --kernel "$kernel" > "${logpfx}_$r.log" 2>&1 || return 1
         cp "results/${kernel}_sweep.csv" "${logpfx}_$r.csv"
         csvs+=("${logpfx}_$r.csv")
     done
@@ -182,11 +182,11 @@ fi
 
 if [ ! -d testdata/validate ]; then
     log "generating validation datasets ..."
-    python3 generate_test_data.py || exit 1
+    python3 validation/generate_test_data.py || exit 1
 fi
 
 log "establishing accuracy baseline -> /tmp/baseline.txt"
-python3 validate_int8.py > /tmp/baseline.txt 2>&1 || {
+python3 validation/validate_int8.py > /tmp/baseline.txt 2>&1 || {
     log "ERROR: baseline validation FAILED — fix before evolving."
     tail -20 /tmp/baseline.txt; exit 1; }
 
@@ -330,7 +330,7 @@ EOF
     VAL_OK=0
     for attempt in 0 1 2; do
         log "validate_int8.py (attempt $attempt) ..."
-        if python3 validate_int8.py > "$LOG_DIR/validate_${i}_$attempt.log" 2>&1
+        if python3 validation/validate_int8.py > "$LOG_DIR/validate_${i}_$attempt.log" 2>&1
         then VAL_OK=1; break; fi
         [ "$attempt" -eq 2 ] && break
         run_claude "$LOG_DIR/claude_fixval_${i}_$attempt.log" <<EOF

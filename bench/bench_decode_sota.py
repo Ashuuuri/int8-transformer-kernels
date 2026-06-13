@@ -24,16 +24,19 @@ cos is vs an fp32 SDPA reference (computed only where the FP16 KV still fits).
 Usage: python3 bench_decode_sota.py
 """
 import os
+import sys
 import csv
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (one up from bench/)
+sys.path.insert(0, os.path.join(ROOT, "common"))
 from benchmark import benchmark
 
 import flashinfer
 
-CSV_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "results", "decode_sota.csv")
+CSV_OUT = os.path.join(ROOT, "results", "decode_sota.csv")
 
 # serving-scale configs (skip grid-starved small b*h); D ∈ {64,128}.
 CONFIGS = [(32, 8, 64), (64, 16, 64), (128, 16, 64), (64, 16, 128)]

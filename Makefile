@@ -6,8 +6,8 @@
 #   make clean
 #
 # The Python correctness + benchmark + validation flow (tests/test_int8.py,
-# validate_int8.py, sweep.py) JIT-builds the kernels via torch cpp_extension and
-# needs no Makefile — see README.md / CLAUDE.md.
+# validation/validate_int8.py, bench/sweep.py) JIT-builds the kernels via torch
+# cpp_extension and needs no Makefile — see README.md / CLAUDE.md.
 
 NVCC       = nvcc
 NVCC_FLAGS = -arch=sm_80 --std=c++17 -O3

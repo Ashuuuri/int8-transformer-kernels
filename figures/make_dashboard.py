@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Patch
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (one up from figures/)
 RES = os.path.join(ROOT, "results")
 FIGDIR = os.path.join(RES, "figures")
 os.makedirs(FIGDIR, exist_ok=True)

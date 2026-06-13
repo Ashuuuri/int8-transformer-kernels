@@ -36,14 +36,17 @@ accuracy path, matching validate_int8.py Gate 5), not the per-tensor legacy path
 Usage:  python3 bench_block.py
 """
 import os
+import sys
 import csv
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (one up from bench/)
+sys.path.insert(0, os.path.join(ROOT, "common"))
 from benchmark import benchmark
 
-CSV_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "results", "block.csv")
+CSV_OUT = os.path.join(ROOT, "results", "block.csv")
 
 
 def _load():

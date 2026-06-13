@@ -20,7 +20,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
 from baseline import attention_baseline, mlp_baseline, check_cuda
 from correctness import check_correctness
 from benchmark import benchmark

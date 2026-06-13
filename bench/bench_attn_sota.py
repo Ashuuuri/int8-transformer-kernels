@@ -33,10 +33,12 @@ import csv
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (one up from bench/)
+sys.path.insert(0, os.path.join(ROOT, "common"))
 from benchmark import benchmark
 
-CSV_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "results", "attn_sota.csv")
+CSV_OUT = os.path.join(ROOT, "results", "attn_sota.csv")
 
 BATCH, HEADS, HEAD_DIM = 8, 8, 64
 SEQS = [512, 1024, 2048, 4096]

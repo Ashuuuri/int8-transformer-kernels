@@ -20,14 +20,17 @@ batch per card, half the bytes streamed per token).
 Usage: python3 bench_attn_decode.py
 """
 import os
+import sys
 import csv
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (one up from bench/)
+sys.path.insert(0, os.path.join(ROOT, "common"))
 from benchmark import benchmark
 
-CSV_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "results", "attn_decode.csv")
+CSV_OUT = os.path.join(ROOT, "results", "attn_decode.csv")
 
 # (batch, heads, head_dim) — small to serving-scale; one warp per (b,h), so
 # batch*heads is the parallelism (small b*h is grid-starved on 108 SMs).

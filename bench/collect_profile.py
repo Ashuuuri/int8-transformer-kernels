@@ -10,7 +10,7 @@ import csv, os, torch
 from torch.utils.cpp_extension import load
 from torch.profiler import profile, ProfilerActivity
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (one up from bench/)
 # Graded shape (matches profile_kernel.py / CLAUDE.md §3): b=8, s=512.
 B, S, DM, DFF = 8, 512, 1024, 4096
 HEADS, HEAD_DIM = 8, 64

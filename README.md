@@ -118,19 +118,28 @@ tests/
   cuda/test_int8.cu          pure-CUDA smoke test (reads .bin fixtures)
   gen_testdata.py            writes the .bin fixtures for the smoke test
 
-validate_int8.py             5-gate accuracy validation (Gate 5 = real GPT-2 perplexity)
-generate_test_data.py        8-distribution INT8 validation datasets
-prepare_real_corpus.py       fetch WikiText-2 for Gate 5
-sweep.py                     latency/throughput sweep -> results/*.csv
-profile_kernel.py            ncu-friendly driver on the GRADED shape
-collect_profile.py           torch.profiler per-kernel time split (no sudo)
-make_figures.py              clean seaborn figure set (hero + themed)
-make_dashboard.py            legacy single consolidated dashboard
-bench_attn_sota.py           prefill vs SageAttention (INT8 SOTA peer)
-bench_attn_decode.py         decode vs FP16 SDPA
-bench_decode_sota.py         decode vs FlashInfer FP8 (quantized-KV SOTA peer)
-bench_block.py               end-to-end transformer-block wall-clock (INT8 vs FP16)
-benchmark.py / baseline.py / correctness.py   timing + PyTorch references
+validation/                  accuracy gates + test-data generation
+  validate_int8.py           5-gate accuracy validation (Gate 5 = real GPT-2 perplexity)
+  gate5_real_kernel.py       standalone real-kernel GPT-2 perplexity driver (shared with Gate 5)
+  generate_test_data.py      8-distribution INT8 validation datasets
+  prepare_real_corpus.py     fetch WikiText-2 for Gate 5
+
+bench/                       latency/throughput + profiling drivers
+  sweep.py                   latency/throughput sweep -> results/*.csv
+  profile_kernel.py          ncu-friendly driver on the GRADED shape
+  collect_profile.py         torch.profiler per-kernel time split (no sudo)
+  bench_attn_sota.py         prefill vs SageAttention (INT8 SOTA peer)
+  bench_attn_decode.py       decode vs FP16 SDPA
+  bench_decode_sota.py       decode vs FlashInfer FP8 (quantized-KV SOTA peer)
+  bench_block.py             end-to-end transformer-block wall-clock (INT8 vs FP16)
+
+figures/                     plotting (read results/*.csv -> results/figures/*.png)
+  make_figures.py            clean seaborn figure set (hero + themed)
+  make_dashboard.py          legacy dashboard + shared plot/data/byte-model helpers
+
+common/                      shared primitives, imported by the above
+  benchmark.py / baseline.py / correctness.py   timing + PyTorch references
+
 evolve.sh                    autonomous profile -> optimize -> validate -> commit loop
 
 CLAUDE.md                    agent operating guide (the optimization principles)
@@ -156,20 +165,21 @@ make test_int8 && ./test_int8
 python tests/test_int8.py --quick      # correctness only
 python tests/test_int8.py              # + FA2 / cuBLAS baselines
 
-# accuracy validation (the gate for every optimization)
-python generate_test_data.py           # one-time: 8 datasets
-python prepare_real_corpus.py          # one-time: WikiText-2 for Gate 5
-python validate_int8.py                # all datasets × both kernels × 5 gates
+# accuracy validation (the gate for every optimization) — run from the repo root
+python validation/generate_test_data.py   # one-time: 8 datasets
+python validation/prepare_real_corpus.py   # one-time: WikiText-2 for Gate 5
+python validation/validate_int8.py         # all datasets × both kernels × 5 gates
 
-# performance
-python sweep.py --kernel int8_attn
-python sweep.py --kernel int8_mlp
-python bench_decode_sota.py            # decode vs FlashInfer FP8 (needs flashinfer-python)
-python make_figures.py                 # -> results/figures/*.png
+# performance — run from the repo root (scripts resolve results/ & kernels/ there)
+python bench/sweep.py --kernel int8_attn
+python bench/sweep.py --kernel int8_mlp
+python bench/bench_decode_sota.py          # decode vs FlashInfer FP8 (needs flashinfer-python)
+python figures/make_figures.py             # -> results/figures/*.png
 ```
 
-`results/` (CSVs + figures) and `testdata/` are generated locally and are **not**
-checked in — regenerate them with the commands above.
+`results/` (CSVs + figures) **is** checked in as the published benchmark snapshot;
+regenerate it with the commands above and re-commit. `testdata/` is generated
+locally and is **not** checked in (rebuild with `validation/generate_test_data.py`).
 
 ---
 

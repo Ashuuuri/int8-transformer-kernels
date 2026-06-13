@@ -46,7 +46,7 @@ Target hardware: A100-SXM4-40GB, `sm_80`, CUDA 12.8, system PyTorch 2.7.
 |---|---|
 | `kernels/int8_attention.cu` | INT8 **prefill** attention (seq_q == seq_kv). INT8 WMMA QK^T (s32 accum) + FP16 WMMA PV, per-token scales, online softmax, templated on `(TILE_KV, HEAD_DIM)`. |
 | `kernels/int8_decode_attention.cu` | INT8 **decode** attention (seq_q == 1). Split-KV flash-decoding (per-chunk partial online-softmax + log-sum-exp combine), warp-per-(b,h,split), barrier-free. Host dispatches the best partial per head_dim: **D=64 → `dp4a` lane-per-position**, **D=128 → split-KV lane-per-dim**. `INT8_DECODE_DP4A=0` forces the original D=64 path (ablation). |
-| `kernels/int8_mlp.cu` | INT8 MLP. 128×128-tile INT8 WMMA ×2, GELU fused into GEMM1, dynamic per-token quant. Entry points: `int8_mlp_forward` (per-tensor scalar scales, legacy/unchanged), `int8_mlp_forward_per_channel` (per-token act + per-channel weight + per-token output — the real-model accuracy path), `int8_mlp_forward_prepacked` (transpose-once static-weight path; what `sweep.py` grades). |
+| `kernels/int8_mlp.cu` | INT8 MLP. 128×128-tile INT8 WMMA ×2, GELU fused into GEMM1, dynamic per-token quant. Entry points: `int8_mlp_forward` (per-tensor scalar scales, legacy/unchanged), `int8_mlp_forward_per_channel` (per-token act + per-channel weight + per-token output — the real-model accuracy path), `int8_mlp_forward_prepacked` (transpose-once static-weight path; what `bench/sweep.py` grades). |
 | `kernels/int8_common.cuh` | Shared device helpers: GELU, f32→i8, cp.async. |
 | `kernels/quant_utils.cu` | Per-tensor quantize/dequantize utilities. |
 | `kernels/int8_ext.cu` | pybind11 bindings (`torch.utils.cpp_extension.load`, extension name `int8_ext`). |
@@ -94,19 +94,19 @@ python3 -c "from torch.utils.cpp_extension import load; \
 
 The extension rebuilds automatically after `.cu` edits; if the cache misbehaves
 `rm -rf ~/.cache/torch_extensions/py312_cu128/int8_ext`. `flashinfer-python` is
-needed only for `bench_decode_sota.py`; `transformers` + `datasets` only for
+needed only for `bench/bench_decode_sota.py`; `transformers` + `datasets` only for
 Gate 5.
 
 ---
 
 ## 3. Profiling — profile the GRADED shape
 
-**CRITICAL: profile the shape `sweep.py` grades, not `test_int8.py --quick`.**
+**CRITICAL: profile the shape `bench/sweep.py` grades, not `tests/test_int8.py --quick`.**
 `--quick` (batch=2, seq=512) is grid-starved (≈1.18 blocks/SM → `warps_active`
 ~7%); the graded config (batch=8, head_dim=64, seq 512–4096) maxes occupancy (3
 blocks/SM, `warps_active` ~18%). They are different regimes — profiling the toy
 made earlier iterations chase an occupancy/register lever that does not exist in
-the graded config. Use `profile_kernel.py` (sweep-matched shapes) for any
+the graded config. Use `bench/profile_kernel.py` (sweep-matched shapes) for any
 perf-relevant diagnosis.
 
 GPU performance counters require sudo (`ERR_NVGPUCTRPERM` otherwise). Always
@@ -119,10 +119,10 @@ sudo env "PATH=$PATH" HOME="$HOME" \
 sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,\
 l1tex__data_pipe_lsu_wavefronts_mem_shared.sum,\
 launch__registers_per_thread,launch__occupancy_limit_registers \
-    python3 profile_kernel.py attn 2>&1 | grep -A2 -E "Metric|int8_"
+    python3 bench/profile_kernel.py attn 2>&1 | grep -A2 -E "Metric|int8_"
 ```
 
-For per-kernel timings without privileges, `collect_profile.py` /
+For per-kernel timings without privileges, `bench/collect_profile.py` /
 `torch.profiler` need no sudo. ptxas spill/reg check:
 `nvcc -arch=sm_80 -O3 --std=c++17 --ptxas-options=-v -c kernels/int8_mlp.cu -o /dev/null 2>&1 | grep -E "registers|spill"`.
 
@@ -147,7 +147,7 @@ Gate 5 is the realistic gate: it runs each MLP block with the kernel's exact
 per-channel weight + per-token activation + **per-token output** quant. Naive
 per-tensor output quant gives **+64%** real-GPT-2 perplexity (it crushes output
 channel outliers); per-token output recovers it (−0.07%). **Do not revert Gate 5
-to random weights.** The 8 validation datasets (`generate_test_data.py`) target
+to random weights.** The 8 validation datasets (`validation/generate_test_data.py`) target
 specific failure modes — see [`OPTIMIZATION.md`](OPTIMIZATION.md) §"Test data".
 
 ---
@@ -236,11 +236,11 @@ In priority order:
 
 ## 8. Iteration workflow
 
-1. Baseline: `python validate_int8.py` and `python sweep.py --kernel int8_*` —
+1. Baseline: `python validation/validate_int8.py` and `python bench/sweep.py --kernel int8_*` —
    record the numbers.
 2. Make one coherent change.
-3. Correctness: `python validate_int8.py` (all 5 gates).
-4. Performance: `python sweep.py` (median of ≥5; |Δ| < 2% is noise).
+3. Correctness: `python validation/validate_int8.py` (all 5 gates).
+4. Performance: `python bench/sweep.py` (median of ≥5; |Δ| < 2% is noise).
 5. Commit only when both pass, carrying before/after numbers. Append a new entry
    to [`OPTIMIZATION.md`](OPTIMIZATION.md) (newest at the bottom). Record negative
    results too (behind ablation flags).

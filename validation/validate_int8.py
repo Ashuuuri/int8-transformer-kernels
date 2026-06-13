@@ -40,7 +40,8 @@ import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))  # repo-root/common
 from baseline import attention_baseline, mlp_baseline, check_cuda
 
 DATA_DIR = os.path.join("testdata", "validate")
