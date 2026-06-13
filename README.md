@@ -13,6 +13,13 @@ dropped. FP16/cuBLAS/SDPA and external INT8/FP8 kernels are still used as
 *reference baselines* (via PyTorch and pip packages), because the whole point is
 to measure the INT8 kernels against something real.
 
+![INT8 transformer kernels — wins the memory-bound long-context regime](docs/figures/hero.png)
+
+> The headline: INT8 wins the **memory-bound** decode regime (not prefill), the
+> win **grows with context length** and **holds across serving configs**, the KV
+> cache fits **2× the context per card**, and accuracy is **preserved end-to-end**
+> (cos ≥ 0.9986). Numbers below; full evidence in [`OPTIMIZATION.md`](OPTIMIZATION.md).
+
 ---
 
 ## The thesis: INT8 wins on **bytes**, not on peak TOPS
@@ -58,6 +65,13 @@ At D=64 our INT8 decode is competitive-to-ahead of the **production FP8 SOTA at
 equal KV bandwidth, and more accurate** — so the win is real *kernel quality*,
 not merely "quantized vs unquantized". On Ampere, INT8 is the *right* quantized
 format: `sm_80` has no FP8 tensor cores, so FP8 peers pay a software-dequant tax.
+
+![Decode vs a real quantized-KV SOTA (FlashInfer FP8, equal KV bytes)](docs/figures/decode_sota.png)
+
+> Left: vs FlashInfer FP8 at **equal 1 byte/elem KV** — D=64 par-to-win, D=128
+> trails (untuned). Middle: vs FlashInfer FP16 (2× the KV bytes). Right: at equal
+> bytes our **per-token INT8** scales are **more accurate** than FP8's per-tensor
+> scale (cos 0.99995 vs 0.99922).
 
 ### MLP
 
@@ -121,6 +135,7 @@ evolve.sh                    autonomous profile -> optimize -> validate -> commi
 
 CLAUDE.md                    agent operating guide (the optimization principles)
 OPTIMIZATION.md              structured iteration log (the full evidence trail)
+docs/figures/                curated showcase figures used in this README
 ```
 
 ---
