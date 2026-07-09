@@ -47,7 +47,7 @@ A100_INT8_TOPS   = 624.0   # Tensor Core INT8 peak (TOPS)
 # INT8 attention is mixed-precision: QK^T runs INT8 (624) but attn×V runs FP16
 # (312). Equal FLOPs in each half → blended peak = 1/(0.5/624 + 0.5/312).
 A100_INT8_ATTN_TOPS = 416.0
-A100_HBM_BW_TBps = 2.0    # HBM bandwidth peak (TB/s)
+A100_HBM_BW_TBps = 1.555  # HBM peak (TB/s) — A100-SXM4-40GB (the 80 GB part is 2.0)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Sweep grid  (§4 of proposal)

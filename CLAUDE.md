@@ -130,7 +130,10 @@ For per-kernel timings without privileges, `bench/collect_profile.py` /
 
 ## 4. Accuracy validation — 5 gates, no skipping
 
-Run `python validate_int8.py` after **every** optimization. All five must pass;
+Run `python validation/validate_int8.py` after **every** optimization — plus
+`python validation/check_decode.py` (16 edge shapes × both head dims, fp32
+reference) after any decode-kernel change; the 5 gates do not cover decode.
+All five must pass;
 any failure stops the optimization immediately (apply the repair suggestions it
 prints — per-channel quant → QK^T back to fp16 → adjust scales → worst stage back
 to fp16 — then re-run from Gate 1).
@@ -256,5 +259,10 @@ In priority order:
 5. Commit only when both pass, carrying before/after numbers. Append a new entry
    to [`OPTIMIZATION.md`](OPTIMIZATION.md) (newest at the bottom). Record negative
    results too (behind ablation flags).
+6. **Refresh downstream artifacts in the same commit**: if a kernel changed,
+   re-run the benches that consume it (`bench_block.py` uses both kernels!) and
+   regenerate figures — iter 22's block/hero snapshot went stale for a day
+   because this step was missed. Pin/annotate peer versions (flashinfer) when
+   SOTA ratios are re-measured.
 
 `evolve.sh` automates this loop (profile → optimize → validate → commit).

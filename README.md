@@ -18,23 +18,25 @@ to measure the INT8 kernels against something real.
 > The headline: INT8 wins the **memory-bound** decode regime (not prefill), the
 > win **grows with context length** and **holds across serving configs**, the KV
 > cache fits **2× the context per card**, and accuracy is **preserved end-to-end**
-> (cos ≥ 0.9986). Numbers below; full evidence in [`OPTIMIZATION.md`](OPTIMIZATION.md).
+> (cos ≥ 0.9985). Numbers below; full evidence in [`OPTIMIZATION.md`](OPTIMIZATION.md).
 
 ---
 
 ## The thesis: INT8 wins on **bytes**, not on peak TOPS
 
 The headline number is *not* tensor-core utilization. On raw GEMM
-micro-efficiency these hand-written kernels lose to cuBLAS (INT8 GEMM runs
-~0.71–0.88× FP16 cuBLAS throughput, and that gap is structural). **That is not
-the value proposition.**
+micro-efficiency these hand-written kernels lose to cuBLAS (the fused INT8 MLP
+runs ~0.64–0.99× the FP16 cuBLAS MLP, and that gap is structural). **That is
+not the value proposition.**
 
 The value is at the **workload** level, where inference is **memory-bound**:
 
 - **Fusion removes HBM round-trips.** A fused INT8 MLP forward beats a *naive
   INT8 deployment* — `torch._int_mm` + separate dequant / GELU / requant —
-  by **~3.8–4.8×**, because it never round-trips the intermediate tensors
-  through HBM. Peak TOPS is irrelevant when the bottleneck is bytes moved.
+  by **~3.3–5.1×**, because it never round-trips the intermediate tensors
+  through HBM (and still beats the *bare* two `_int_mm` GEMMs with zero-cost
+  epilogues — the physical lower bound — by **1.6–3.0×**). Peak TOPS is
+  irrelevant when the bottleneck is bytes moved.
 - **INT8 halves the KV cache.** In **decode**, where attention is a
   bandwidth-bound GEMV over the KV cache, storing K/V at 1 byte/elem (vs FP16's
   2) halves the bytes streamed per token — the kernel can then *beat* FP16
@@ -88,8 +90,9 @@ peers pay a software-dequant tax. (Effective KV bandwidth: ~0.95 TB/s at D=64,
 ### MLP
 
 - Fused INT8 forward vs the cuBLAS INT8 `_int_mm` + dequant/GELU/requant
-  pipeline: **~3.8–4.8×** (the fusion / memory-bound win).
-- vs FP16 cuBLAS GEMM throughput: **0.71–0.88×** (and always was — INT8 GEMM
+  pipeline: **~3.3–5.1×** (the fusion / memory-bound win); vs the bare two
+  `_int_mm` GEMMs (zero-cost-epilogue lower bound): **1.6–3.0×**.
+- vs the FP16 cuBLAS MLP: **0.64–0.99×** (and always was — INT8 GEMM
   micro-efficiency is not the win; see the thesis above).
 
 ### Prefill (square) attention
@@ -132,6 +135,7 @@ tests/
 
 validation/                  accuracy gates + test-data generation
   validate_int8.py           5-gate accuracy validation (Gate 5 = real GPT-2 perplexity)
+  check_decode.py            decode-kernel correctness harness (16 edge shapes, both head dims)
   gate5_real_kernel.py       standalone real-kernel GPT-2 perplexity driver (shared with Gate 5)
   generate_test_data.py      8-distribution INT8 validation datasets
   prepare_real_corpus.py     fetch WikiText-2 for Gate 5
@@ -182,6 +186,7 @@ python tests/test_int8.py              # + FA2 / cuBLAS baselines
 python validation/generate_test_data.py   # one-time: 8 datasets
 python validation/prepare_real_corpus.py   # one-time: WikiText-2 for Gate 5
 python validation/validate_int8.py         # all datasets × both kernels × 5 gates
+python validation/check_decode.py          # decode kernel: 16 edge shapes × both head dims
 
 # performance — run from the repo root (scripts resolve results/ & kernels/ there)
 python bench/sweep.py --kernel int8_attn
@@ -193,6 +198,14 @@ python figures/make_figures.py             # -> results/figures/*.png
 `results/` (CSVs + figures) **is** checked in as the published benchmark snapshot;
 regenerate it with the commands above and re-commit. `testdata/` is generated
 locally and is **not** checked in (rebuild with `validation/generate_test_data.py`).
+
+Snapshot provenance: each reported latency is `common/benchmark.py`'s mean of
+50 timed iterations (10 warmup, CUDA events); claims are based on medians of
+≥5 such runs (run-to-run noise ~2% on this box). Peer versions for the
+snapshot: **flashinfer-python 0.6.14** (peer version moves the FP8 ratios by
+up to ~18% — 0.6.12 was that much slower at some shapes), PyTorch 2.7 / CUDA
+12.8. `pip install ninja transformers datasets flashinfer-python==0.6.14` plus
+`apt install pybind11-dev` reproduces the environment.
 
 ---
 
