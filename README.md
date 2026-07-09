@@ -2,120 +2,128 @@
 
 [![build-check](https://github.com/Ashuuuri/int8-transformer-kernels/actions/workflows/build-check.yml/badge.svg)](https://github.com/Ashuuuri/int8-transformer-kernels/actions/workflows/build-check.yml)
 
-Fused **INT8 transformer inference kernels** for the NVIDIA A100 (`sm_80`,
-CUDA 12.8) — attention (prefill **and** decode) and MLP — written in CUDA with
-WMMA / `mma.sync` tensor-core paths and `dp4a`, exposed to PyTorch via
-`torch.utils.cpp_extension`.
+Hand-written **INT8 transformer inference kernels** for the NVIDIA A100 —
+attention (prefill **and** decode) and MLP — in CUDA with WMMA / `mma.sync`
+tensor-core paths and `dp4a`, exposed to PyTorch via `torch.utils.cpp_extension`.
 
-This repo is the INT8 track extracted from a larger CUDA transformer
-optimization project (originally a 3-person course project; the INT8 kernels
-were then taken solo through ~18 optimization iterations). It keeps **only the
-INT8 kernels, their tooling, and the docs** — the FP16 baseline kernels were
-dropped. FP16/cuBLAS/SDPA and external INT8/FP8 kernels are still used as
-*reference baselines* (via PyTorch and pip packages), because the whole point is
-to measure the INT8 kernels against something real.
+**TL;DR**
+
+- **Decode attention beats FlashInfer's production FP8 kernels** at head_dim 64
+  (1.14–1.48×) and matches them at head_dim 128 — at equal KV-cache bytes, with
+  *better* accuracy.
+- The INT8 KV cache **halves the bytes per token**, so decode beats FP16 SDPA
+  everywhere (up to 1.89×) and fits **2× the context per card**.
+- Accuracy is validated end-to-end: **real GPT-2 perplexity on WikiText-2
+  changes < 0.07%**.
+- Prefill attention **loses** to FlashAttention-2, and the fused MLP **loses**
+  to cuBLAS FP16 on raw GEMM efficiency. Both reported honestly — the thesis
+  below explains why that's expected.
 
 ![INT8 transformer kernels — wins the memory-bound long-context regime](docs/figures/hero.png)
 
-> The headline: INT8 wins the **memory-bound** decode regime (not prefill), the
-> win **grows with context length** and **holds across serving configs**, the KV
-> cache fits **2× the context per card**, and accuracy is **preserved end-to-end**
-> (cos ≥ 0.9985). Numbers below; full evidence in [`OPTIMIZATION.md`](OPTIMIZATION.md).
+Target: A100-SXM4-40GB (`sm_80`), CUDA 12.8, PyTorch 2.7. Full evidence trail
+in [`OPTIMIZATION.md`](OPTIMIZATION.md).
 
 ---
 
 ## The thesis: INT8 wins on **bytes**, not on peak TOPS
 
-The headline number is *not* tensor-core utilization. On raw GEMM
-micro-efficiency these hand-written kernels lose to cuBLAS (the fused INT8 MLP
-runs ~0.64–0.99× the FP16 cuBLAS MLP, and that gap is structural). **That is
-not the value proposition.**
+LLM inference is **memory-bound** where it matters (decode, long context). INT8
+helps not because int8 math is fast, but because int8 **tensors are small**:
 
-The value is at the **workload** level, where inference is **memory-bound**:
+1. **Half the KV cache.** Decode attention is a bandwidth-bound GEMV over the
+   KV cache. Storing K/V at 1 byte/elem instead of FP16's 2 halves the bytes
+   streamed per token — that alone is a ~2× ceiling raise.
+2. **Fusion removes HBM round-trips.** The fused INT8 MLP never writes its
+   intermediate tensors to HBM. That is why it beats a naive INT8 deployment
+   (`torch._int_mm` + separate dequant / GELU / requant) by **3.3–5.1×** even
+   though its raw GEMMs are slower than cuBLAS.
 
-- **Fusion removes HBM round-trips.** A fused INT8 MLP forward beats a *naive
-  INT8 deployment* — `torch._int_mm` + separate dequant / GELU / requant —
-  by **~3.3–5.1×**, because it never round-trips the intermediate tensors
-  through HBM (and still beats the *bare* two `_int_mm` GEMMs with zero-cost
-  epilogues — the physical lower bound — by **1.6–3.0×**). Peak TOPS is
-  irrelevant when the bottleneck is bytes moved.
-- **INT8 halves the KV cache.** In **decode**, where attention is a
-  bandwidth-bound GEMV over the KV cache, storing K/V at 1 byte/elem (vs FP16's
-  2) halves the bytes streamed per token — the kernel can then *beat* FP16
-  attention and fit 2× the context per card.
-
-So every optimization here is judged by **wall-clock latency** and **bytes
-moved / kernel launches**, never by a stall-counter for its own sake. A change
-that raises tensor-pipe % but adds an HBM round-trip is a loss; one that lowers
-it but removes a round-trip is a win.
+The corollary is what INT8 *can't* do: prefill and big GEMMs are
+**compute-bound**, so smaller bytes buy nothing there — these kernels lose to
+FlashAttention-2 and cuBLAS FP16, and no amount of tuning changes that.
+Every optimization here was therefore judged by **wall-clock latency and bytes
+moved**, never by tensor-pipe % for its own sake.
 
 ![A100 roofline — the INT8 journey](docs/figures/roofline.png)
 
-> The thesis on one chart (regenerate with `python figures/make_roofline.py`).
-> Left: prefill/MLP live on the compute-bound side of the ridge where INT8
-> bytes can't help; decode lives at ~2 OPs/byte where they're everything.
-> Right: FP16 SDPA already runs at ~87% of its roof — the only way past it is
-> **more intensity** (INT8 KV halves the bytes → 2× the ceiling), and the
-> iter 14→15→21→22 kernel work climbs to 65% (D=64) / 78% (D=128) of the
-> raised roof.
+*The thesis on one chart. Left: prefill/MLP sit on the compute-bound side of
+the ridge where INT8 bytes can't help; decode sits at ~2 OPs/byte where they
+are everything. Right: FP16 SDPA already runs at ~87% of its roof — the only
+way past it is more intensity (INT8 KV halves the bytes → 2× the ceiling), and
+the kernel work climbs to 65% (D=64) / 78% (D=128) of that raised roof.
+Regenerate with `python figures/make_roofline.py`.*
 
 ---
 
 ## Headline results (A100-SXM4-40GB)
 
-> Measured numbers and the full evidence trail are in
-> [`OPTIMIZATION.md`](OPTIMIZATION.md). Latencies are medians of ≥5 runs;
-> run-to-run noise on this box is ~2%.
+All latencies are **medians of ≥5 runs** (each the mean of 50 timed iterations
+with CUDA events); run-to-run noise on this box is ~2%. Peer versions and the
+exact environment are pinned under [Reproducing](#reproducing-the-snapshot).
 
 ### Decode attention — INT8 KV cache (the strongest result)
 
-| Comparison (equal-or-fairer peer) | Result |
-|---|---|
-| vs **FP16 SDPA** | **WIN at every shape, both head dims** (batched lane-per-dim, iters 21–22): D=64 **1.45–1.89×** at serving scale (B≥32; even B=8 wins 1.10–1.31×), D=128 **1.74–1.82×**, at **half the KV bytes** |
-| vs **FlashInfer FP8** decode (same 1 byte/elem KV) | D=64 **WIN outright, 1.14–1.48×**; D=128 **par** 0.89–1.07× (wins ≤8K ctx, −10% at ≥16K). Both **more accurate** (cos 0.99995 vs 0.99922). Two fairness notes, measured: (a) peer version — vs flashinfer **0.6.14**; 0.6.12 was ~18% slower at some shapes; (b) FlashInfer serves **paged** KV (PAGE=16, the vLLM-style production config) while ours is contiguous — re-measured at PAGE=256 the paging tax (~3–12%) narrows things: D=64 win holds (1.14–1.31×), D=128 reads 0.86–0.88× |
-| vs **FlashInfer FP16** (well-tuned, 2 bytes/elem) | **1.45–1.74×** (the structural half-bytes win) |
+| Baseline | KV bytes/elem | head_dim 64 | head_dim 128 |
+|---|---|---|---|
+| FP16 SDPA | 2 | **1.45–1.89×** at serving scale (B≥32); 1.10–1.31× even at B=8 | **1.74–1.82×** |
+| FlashInfer FP16 | 2 | **1.45–1.62×** | **1.74×** |
+| **FlashInfer FP8** (the SOTA peer) | 1 (equal) | **1.14–1.48× — wins outright** | **par**: 0.89–1.07× (wins ≤8K ctx, −10% at ≥16K) |
 
-Our INT8 decode now **beats the production FP8 SOTA outright at D=64 and
-matches it at D=128 — at equal KV bandwidth, and more accurate** — so the win
-is real *kernel quality*, not merely "quantized vs unquantized". On Ampere,
-INT8 is the *right* quantized format: `sm_80` has no FP8 tensor cores, so FP8
-peers pay a software-dequant tax. (Effective KV bandwidth: ~0.95 TB/s at D=64,
-~1.18 TB/s at D=128 — 61–76% of the A100-40GB HBM peak.)
+Beating the FP8 peer matters because it is the *equal-bytes* comparison: at the
+same 1 byte/elem KV bandwidth, the win is **kernel quality**, not just
+"quantized vs unquantized". And the INT8 side is *more accurate* — per-token
+INT8 scales vs FP8's per-tensor scale, output cosine **0.99995 vs 0.99922**.
+On Ampere INT8 is also the right format: `sm_80` has no FP8 tensor cores, so
+FP8 peers pay a software-dequant tax.
+
+Effective KV-read bandwidth: ~0.95 TB/s (D=64) / ~1.18 TB/s (D=128) — 61–76%
+of the A100-40GB HBM peak.
+
+**Fairness notes** (both measured, not hand-waved):
+
+- *Peer version drift*: numbers above are vs **flashinfer 0.6.14**; 0.6.12 was
+  up to ~18% slower at some shapes.
+- *Paged vs contiguous KV*: FlashInfer serves paged KV (PAGE=16, the
+  vLLM-style production config) while ours is contiguous. Re-measured at
+  PAGE=256 the paging tax (~3–12%) narrows things: the D=64 win holds
+  (1.14–1.31×), D=128 reads 0.86–0.88×.
 
 ![Decode vs a real quantized-KV SOTA (FlashInfer FP8, equal KV bytes)](docs/figures/decode_sota.png)
 
-> Left: vs FlashInfer FP8 at **equal 1 byte/elem KV** — D=64 wins outright,
-> D=128 par. Middle: vs FlashInfer FP16 (2× the KV bytes). Right: at equal
-> bytes our **per-token INT8** scales are **more accurate** than FP8's per-tensor
-> scale (cos 0.99995 vs 0.99922).
+*Left: vs FlashInfer FP8 at equal 1 byte/elem KV. Middle: vs FlashInfer FP16
+(2× the KV bytes). Right: accuracy at equal bytes.*
 
-### MLP
+### MLP — the fusion win
 
-- Fused INT8 forward vs the cuBLAS INT8 `_int_mm` + dequant/GELU/requant
-  pipeline: **~3.3–5.1×** (the fusion / memory-bound win); vs the bare two
-  `_int_mm` GEMMs (zero-cost-epilogue lower bound): **1.6–3.0×**.
-- vs the FP16 cuBLAS MLP: **0.64–0.99×** (and always was — INT8 GEMM
-  micro-efficiency is not the win; see the thesis above).
+| Baseline | Result |
+|---|---|
+| Naive INT8 deployment: `torch._int_mm` + separate dequant / GELU / requant | **3.3–5.1×** |
+| Bare two `_int_mm` GEMMs (zero-cost-epilogue lower bound) | **1.6–3.0×** |
+| FP16 cuBLAS MLP | 0.64–0.99× (loses — raw GEMM efficiency is not the win) |
 
-### Prefill (square) attention
+### Prefill attention
 
-- **Loses to FlashAttention-2** — prefill is compute-bound, so the INT8 byte
-  advantage does not pay off there. Honestly reported, not hidden.
+**Loses to FlashAttention-2.** Prefill is compute-bound, so the INT8 byte
+advantage never pays off. Reported, not hidden.
 
-### Accuracy
+### Accuracy — five gates, real weights
 
-Five-gate validation (`validate_int8.py`), including **real GPT-2 perplexity on
-WikiText-2** with the kernel-faithful per-channel-weight / per-token-activation /
-per-token-output quantization: **perplexity change < 0.07%**. (Naive per-tensor
-output quant gives +64% perplexity on real weights — per-token output quant is
-the fix.)
+`validation/validate_int8.py` runs five gates, ending in **real GPT-2
+perplexity on WikiText-2** with the kernel's exact quantization
+(per-channel weight / per-token activation / per-token output):
+**perplexity change < 0.07%**.
+
+The per-token *output* quant is load-bearing: naive per-tensor output quant
+costs **+64% perplexity** on real GPT-2 weights because it crushes
+output-channel outliers.
 
 ### End-to-end transformer block
 
-INT8 (attention core + MLP, with LayerNorm/residual/projections kept FP16) wins
-**only** in the bandwidth-bound long-context **decode** regime (crosses 1.0× at
-~4K context, up to **1.51× @ 32K** after the iter-21/22 decode kernels) and
-loses in compute-bound prefill — fully consistent with every per-kernel result.
+INT8 (attention core + MLP; LayerNorm/residual/projections kept FP16) wins
+**only** in bandwidth-bound long-context decode — crossing 1.0× at ~4K context
+and reaching **1.51× at 32K** — and loses in compute-bound prefill. Fully
+consistent with the per-kernel results above.
 
 ---
 
@@ -124,59 +132,57 @@ loses in compute-bound prefill — fully consistent with every per-kernel result
 ```
 kernels/
   int8_attention.cu          INT8 prefill attention (WMMA QK^T s8→s32, FP16 PV, online softmax)
-  int8_decode_attention.cu   INT8 decode attention (split-KV flash-decoding; dp4a @ D=64)
+  int8_decode_attention.cu   INT8 decode attention (split-KV flash-decoding)
   int8_mlp.cu                INT8 MLP (2× INT8 WMMA GEMM, fused GELU, dynamic + per-channel quant)
   int8_common.cuh            shared device helpers (GELU, f32→i8, cp.async)
   quant_utils.cu             per-tensor quantize/dequantize utilities
   int8_ext.cu                pybind11 bindings (torch cpp_extension.load)
 
-tests/
-  test_int8.py               Python correctness + benchmark (vs FA2 / cuBLAS)
-  cuda/test_int8.cu          pure-CUDA smoke test (reads .bin fixtures)
-  gen_testdata.py            writes the .bin fixtures for the smoke test
-
 validation/                  accuracy gates + test-data generation
   validate_int8.py           5-gate accuracy validation (Gate 5 = real GPT-2 perplexity)
-  check_decode.py            decode-kernel correctness harness (16 edge shapes, both head dims)
-  gate5_real_kernel.py       standalone real-kernel GPT-2 perplexity driver (shared with Gate 5)
+  check_decode.py            decode correctness harness (16 edge shapes, both head dims)
+  gate5_real_kernel.py       standalone real-kernel GPT-2 perplexity driver
   generate_test_data.py      8-distribution INT8 validation datasets
   prepare_real_corpus.py     fetch WikiText-2 for Gate 5
 
 bench/                       latency/throughput + profiling drivers
   sweep.py                   latency/throughput sweep -> results/*.csv
-  profile_kernel.py          ncu-friendly driver on the GRADED shape
+  profile_kernel.py          ncu-friendly driver on the graded shape
   collect_profile.py         torch.profiler per-kernel time split (no sudo)
   bench_attn_sota.py         prefill vs SageAttention (INT8 SOTA peer)
   bench_attn_decode.py       decode vs FP16 SDPA
   bench_decode_sota.py       decode vs FlashInfer FP8 (quantized-KV SOTA peer)
   bench_block.py             end-to-end transformer-block wall-clock (INT8 vs FP16)
 
-figures/                     plotting (read results/*.csv -> results/figures/*.png)
-  make_figures.py            clean seaborn figure set (hero + themed)
-  make_roofline.py           A100 roofline of the optimization journey (thesis chart)
-  make_dashboard.py          legacy dashboard + shared plot/data/byte-model helpers
+tests/
+  test_int8.py               Python correctness + benchmark (vs FA2 / cuBLAS)
+  cuda/test_int8.cu          pure-CUDA smoke test (reads .bin fixtures)
+  gen_testdata.py            writes the .bin fixtures for the smoke test
 
-common/                      shared primitives, imported by the above
-  benchmark.py / baseline.py / correctness.py   timing + PyTorch references
+figures/                     plotting (results/*.csv -> results/figures/*.png)
+common/                      shared timing + PyTorch-reference primitives
+results/                     committed benchmark snapshot (CSVs + figures)
+docs/figures/                curated showcase figures used in this README
 
 evolve.sh                    autonomous profile -> optimize -> validate -> commit loop
-
 CLAUDE.md                    agent operating guide (the optimization principles)
 OPTIMIZATION.md              structured iteration log (the full evidence trail)
-docs/figures/                curated showcase figures used in this README
 ```
 
 ---
 
 ## Quickstart
 
-Environment: A100 (`sm_80`), CUDA 12.8, system PyTorch 2.7. The INT8 extension
-JIT-builds via `torch.utils.cpp_extension.load`, which needs **ninja** and the
-**pybind11 C++ headers on the system include path** — see CLAUDE.md §"Environment
-setup" for the exact one-time install (`ninja` + `pybind11-dev`). Python
-dependencies: `pip install -r requirements.txt` (PyTorch itself is assumed
-present, matching your CUDA). CI runs a GPU-free `nvcc -arch=sm_80` compile
-check on every push (`.github/workflows/build-check.yml`).
+Environment: A100 (`sm_80`), CUDA 12.8, PyTorch 2.7. One-time system setup
+(the JIT build needs ninja and the pybind11 headers — details in CLAUDE.md
+§"Environment setup"):
+
+```bash
+sudo apt-get install -y pybind11-dev
+pip install -r requirements.txt        # PyTorch itself: install the wheel matching your CUDA
+```
+
+Then:
 
 ```bash
 # pure-CUDA smoke test
@@ -188,35 +194,43 @@ python tests/test_int8.py --quick      # correctness only
 python tests/test_int8.py              # + FA2 / cuBLAS baselines
 
 # accuracy validation (the gate for every optimization) — run from the repo root
-python validation/generate_test_data.py   # one-time: 8 datasets
+python validation/generate_test_data.py    # one-time: 8 datasets
 python validation/prepare_real_corpus.py   # one-time: WikiText-2 for Gate 5
 python validation/validate_int8.py         # all datasets × both kernels × 5 gates
-python validation/check_decode.py          # decode kernel: 16 edge shapes × both head dims
+python validation/check_decode.py          # decode: 16 edge shapes × both head dims
 
-# performance — run from the repo root (scripts resolve results/ & kernels/ there)
+# performance — run from the repo root
 python bench/sweep.py --kernel int8_attn
 python bench/sweep.py --kernel int8_mlp
-python bench/bench_decode_sota.py          # decode vs FlashInfer FP8 (needs flashinfer-python)
+python bench/bench_decode_sota.py          # decode vs FlashInfer FP8
 python figures/make_figures.py             # -> results/figures/*.png
 ```
 
-`results/` (CSVs + figures) **is** checked in as the published benchmark snapshot;
-regenerate it with the commands above and re-commit. `testdata/` is generated
-locally and is **not** checked in (rebuild with `validation/generate_test_data.py`).
+CI runs a GPU-free `nvcc -arch=sm_80` compile check on every push
+(`.github/workflows/build-check.yml`).
 
-Snapshot provenance: each reported latency is `common/benchmark.py`'s mean of
-50 timed iterations (10 warmup, CUDA events); claims are based on medians of
-≥5 such runs (run-to-run noise ~2% on this box). Peer versions for the
-snapshot: **flashinfer-python 0.6.14** (peer version moves the FP8 ratios by
-up to ~18% — 0.6.12 was that much slower at some shapes), PyTorch 2.7 / CUDA
-12.8. `pip install ninja transformers datasets flashinfer-python==0.6.14` plus
-`apt install pybind11-dev` reproduces the environment.
+### Reproducing the snapshot
+
+`results/` (CSVs + figures) is checked in as the published benchmark snapshot;
+regenerate with the commands above and re-commit. `testdata/` is generated
+locally and not checked in.
+
+Provenance of every reported number:
+
+- **Timing**: mean of 50 timed iterations (10 warmup, CUDA events) per run;
+  claims use the **median of ≥5 runs**. Run-to-run noise ~2% on this box.
+- **Peers**: `flashinfer-python==0.6.14` (pinned in `requirements.txt` —
+  version moves the FP8 ratios by up to ~18%), PyTorch 2.7, CUDA 12.8.
 
 ---
 
 ## License & provenance
 
-Continued solo by the repo owner from a CS 5220 course project; this repo
-contains only the owner's INT8 work. See [`OPTIMIZATION.md`](OPTIMIZATION.md)
-for the full iteration history and [`CLAUDE.md`](CLAUDE.md) for the operating
-principles an agent should follow when extending it.
+MIT. Continued solo by the repo owner from a CS 5220 course project (originally
+3-person; the FP16 baseline kernels were dropped, and this repo contains only
+the owner's INT8 track — kernels, tooling, docs). FP16/cuBLAS/SDPA and external
+INT8/FP8 kernels are used as *reference baselines* via PyTorch and pip
+packages, because the point is to measure against something real.
+
+See [`OPTIMIZATION.md`](OPTIMIZATION.md) for the full iteration history and
+[`CLAUDE.md`](CLAUDE.md) for the operating principles used while extending it.
