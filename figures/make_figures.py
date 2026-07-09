@@ -216,7 +216,7 @@ def panel_sota_speedup(ax, rows, col, title, ylabel):
         x = [int(r["S"]) for r in sub]; allx.update(x)
         ax.plot(x, [r[col] for r in sub], marker=("s" if Dd == 128 else "o"),
                 color=color, lw=2.2, ms=6,
-                label=f"B{B} H{H} D{Dd}" + (" (untuned)" if Dd == 128 else ""))
+                label=f"B{B} H{H} D{Dd}")
     ax.set_xscale("log", base=2)
     allx = sorted(allx)
     ax.set_xticks(allx); ax.set_xticklabels([_kfmt(s) for s in allx], fontsize=8)
@@ -339,7 +339,7 @@ def main():
                 "Decode vs a real quantized-KV SOTA (FlashInfer FP8, equal KV bytes)",
                 lambda ax: (
                     panel_sota_speedup(ax[0], dsota, "spd_vs_fp8",
-                        "vs FP8 SOTA — D=64 par/win, D=128 trails (untuned)",
+                        "vs FP8 SOTA — par at both head dims (D=128 wins ≤8K)",
                         "speedup vs FlashInfer FP8 (>1 = ours faster)"),
                     panel_sota_speedup(ax[1], dsota, "spd_vs_fp16",
                         "vs FP16 (FlashInfer, 2× the KV bytes)",

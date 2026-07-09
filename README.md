@@ -57,19 +57,20 @@ it but removes a round-trip is a win.
 
 | Comparison (equal-or-fairer peer) | Result |
 |---|---|
-| vs **FP16 SDPA**, serving scale (B≥32) | **WIN** both head dims: D=64 **1.24–1.56×** (`dp4a`), D=128 **1.23×** (split-KV), at **half the KV bytes** |
-| vs **FlashInfer FP8** decode (same 1 byte/elem KV) | D=64 **par-to-win** (up to **1.28×**) **and more accurate** (cos 0.99995 vs 0.99922); D=128 **loses ~1.5×** (untuned path — a concrete next target) |
-| vs **FlashInfer FP16** (well-tuned, 2 bytes/elem) | ~**1.06–1.21×** (the structural half-bytes win, honestly smaller than vs the weaker SDPA baseline) |
+| vs **FP16 SDPA**, serving scale (B≥32) | **WIN** both head dims: D=64 **1.04–1.47×** (`dp4a`), D=128 **1.75–1.82×** (batched lane-per-dim, iter 21), at **half the KV bytes** |
+| vs **FlashInfer FP8** decode (same 1 byte/elem KV) | **par at both head dims and more accurate** (cos 0.99995 vs 0.99922): D=64 0.80–1.16×, D=128 0.89–1.07× (wins ≤8K ctx, −10% at ≥16K). Peer-version sensitive: measured vs flashinfer **0.6.14**; the 0.6.12 snapshot was ~18% slower at some shapes |
+| vs **FlashInfer FP16** (well-tuned, 2 bytes/elem) | ~**1.04–1.75×** (the structural half-bytes win, honestly smaller than vs the weaker SDPA baseline) |
 
-At D=64 our INT8 decode is competitive-to-ahead of the **production FP8 SOTA at
+At **both head dims** our INT8 decode is par with the **production FP8 SOTA at
 equal KV bandwidth, and more accurate** — so the win is real *kernel quality*,
 not merely "quantized vs unquantized". On Ampere, INT8 is the *right* quantized
 format: `sm_80` has no FP8 tensor cores, so FP8 peers pay a software-dequant tax.
+(D=128 reaches ~1.30 TB/s effective KV bandwidth, ~84% of the A100-40GB HBM peak.)
 
 ![Decode vs a real quantized-KV SOTA (FlashInfer FP8, equal KV bytes)](docs/figures/decode_sota.png)
 
-> Left: vs FlashInfer FP8 at **equal 1 byte/elem KV** — D=64 par-to-win, D=128
-> trails (untuned). Middle: vs FlashInfer FP16 (2× the KV bytes). Right: at equal
+> Left: vs FlashInfer FP8 at **equal 1 byte/elem KV** — par at both head dims
+> (D=128 wins ≤8K ctx). Middle: vs FlashInfer FP16 (2× the KV bytes). Right: at equal
 > bytes our **per-token INT8** scales are **more accurate** than FP8's per-tensor
 > scale (cos 0.99995 vs 0.99922).
 

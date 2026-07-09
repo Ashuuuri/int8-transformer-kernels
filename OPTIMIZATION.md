@@ -35,6 +35,9 @@ behind the distilled, still-actionable conclusions in
 | 16 | 2026-06-13 | attn (accuracy) | SageAttention-style K/V smoothing | **NEGATIVE** no output benefit (no code) |
 | 17 | 2026-06-13 | full block | first end-to-end block wall-clock | INT8 wins only long-context decode |
 | 18 | 2026-06-13 | decode (bench) | vs FlashInfer FP8 (quantized-KV SOTA) | D=64 par-to-win + more accurate; D=128 −1.5× |
+| 19 | 2026-06-13 | accuracy | Gate 5 runs the real INT8 MLP kernel in GPT-2 | real ppl +0.134% (< 2% bar) |
+| 20 | 2026-07-09 | decode | TARGET_UNITS occupancy sweep (first decode `ncu`) | **NEUTRAL** — reg-capped at 10 blocks/SM; occupancy lever closed |
+| 21 | 2026-07-09 | decode | batched lane-per-dim partial (D=128) | **WIN** −26…−35%; vs SDPA 1.19→1.75–1.82×; vs FP8 0.59–0.75→0.89–1.07× |
 
 ---
 
@@ -294,3 +297,64 @@ the structure that later let the occupancy analysis conclude the well is dry.
   per-token output quant is what recovers it — do not revert.)
 - **Note**: this is an accuracy/validation-integrity change, not a perf change;
   no inner loop or graded shape was touched.
+
+### Iteration 20 — decode: TARGET_UNITS occupancy sweep — NEUTRAL (occupancy lever closed)
+- **Context**: first-ever `ncu` profile of the decode kernels (they were never
+  profiled in iters 14–18; B=64 H=16 S=8192, `sudo apt install nsight-compute`,
+  binary at `/usr/lib/nsight-compute/ncu`). Both shipped partials turned out
+  **memory-latency-bound at ~half of HBM peak**: D=128 lane-per-dim 49% DRAM /
+  73–75% `long_scoreboard` / 57% `warps_active`; D=64 dp4a 48% DRAM / **89%**
+  `long_scoreboard` / 58% `warps_active`; 48 regs/thread both (not reg-starved
+  per thread, but 48 regs × 128 thr caps residency at 10 blocks/SM = 40/64
+  warps). The combine kernel is negligible.
+- **Change (experiment)**: made the host `TARGET_UNITS` heuristic (4096)
+  runtime-overridable via env `INT8_DECODE_TARGET_UNITS` (read once; default
+  unchanged) and swept 4096/8192/16384/32768, median-of-5 per shape.
+- **Result**: NEUTRAL. All serving shapes within ±2% noise except D=128 long
+  context (−3.1…−3.6% at S=32K) — because the extra blocks only queue behind
+  the 10-block/SM register cap; resident warps do not increase. Matches the
+  MLP's iter-12 lesson from the opposite direction: decode occupancy is closed
+  **by the register ceiling**, not by grid size. The env knob is kept as the
+  tuning hook (shipped default still 4096).
+- **Conclusion**: latency must be hidden **per warp** (more independent loads
+  in flight), not by more warps → iteration 21.
+
+### Iteration 21 — decode: batched lane-per-dim partial for D=128 (the D=128 gap closes)
+- **Change** (`int8_decode_attention.cu`): new
+  `int8_decode_partial_batch_kernel<HEAD_DIM=128, NB>` replaces the original
+  lane-per-dim partial for D=128 (old kernel kept under `INT8_DECODE_BATCH=0`).
+  The original loop was a serial per-position chain — 1-word K load → 6-shuffle
+  score reduction → per-position softmax rescale → V fma — so ≤1 KV row was in
+  flight per warp. The batched kernel processes **NB positions per group**:
+  1. issue all NB K-word + sK/sV scalar loads back-to-back (NB rows in flight),
+     then NB `dp4a` partial dots each reduced with **one sm_80
+     `redux.sync.add`** (`__reduce_add_sync`) instead of the 6-shuffle tree;
+  2. **one** online-softmax update per group (group max is warp-uniform after
+     redux → register max-tree, one corr `__expf`, one acc rescale, NB weight
+     `__expf`s) — mathematically identical to per-position online softmax;
+  3. issue all NB V `char4` loads, then NB fused fma-accumulates.
+  Lane-per-dim layout is unchanged → every K/V access stays a fully-coalesced
+  contiguous 128 B line. Shipped `NB=4` (48 regs — same 10-block/SM residency
+  as before; NB=8→54 regs, NB=16→80 regs tie NB=4 on latency but cost blocks;
+  env `INT8_DECODE_NB` selects 4/8/16 for sweeps). D=64 dispatch untouched.
+- **Profiling** (B64 H16 S8192): DRAM throughput **49% → 82% of peak** at
+  identical occupancy (54.7% warps, 48 regs) — pure memory-level-parallelism
+  win, exactly what iter 20 predicted the axis had to be.
+- **Result** (median of 5): D=128 S=8K **2.561 → 1.795 ms (−30%)**, S=32K
+  **10.204 → 6.585 ms (−35%)**, ~1.30 TB/s effective KV bandwidth (~84% HBM
+  peak). vs FP16 SDPA: **1.19–1.20× → 1.75–1.82×** across S=1K–32K. vs
+  **FlashInfer FP8** (equal 1 B/elem KV): **0.59–0.75× → 0.89–1.07×** — the
+  D=128 gap that iter 18 flagged as the biggest weakness is now par (win ≤8K,
+  −10% at 16K/32K). Note the FP8 peer also *improved* between measurements
+  (0.6.12 → 0.6.14, ~18% faster at some shapes), so this is par against a
+  *faster* SOTA than iter 18 faced. D=64 rows unchanged (1.18–1.21× vs SDPA,
+  regression-checked).
+- **Gates**: all 5 PASS (Gate 5 real-GPT-2 +0.134%); new 16-case decode edge
+  harness (S ∈ {1,31,33,127,128,1000,4096,8192} × both D) all PASS,
+  cos = 1.000000 vs fp32 reference.
+- **Remaining D=128 headroom**: NB=16 and TARGET_UNITS=16384 each buy ~1–2%
+  at S=32K (where FP8 still leads ~10%) — a long-context-only dispatch tweak
+  is the obvious next probe. D=64 dp4a (89% long_scoreboard, 48% DRAM) should
+  respond to the same batching treatment: its lane-per-position layout makes
+  K reads 64 B-strided per lane, so the fix there is likely cp.async smem
+  staging or a hybrid — a separate iteration.

@@ -27,12 +27,20 @@
 // (consecutive lanes read consecutive dims). Barrier-free → stays bandwidth-
 // bound, which is what makes the INT8 KV-cache win show up.
 //
+// DISPATCH (host, empirically best per head_dim):
+//   D=64  → dp4a lane-per-position (iter 15);
+//   D=128 → batched lane-per-dim, NB=4 positions/group (iter 21): batch the
+//           K/V loads for NB positions (NB rows in flight per warp), reduce
+//           each dot with one sm_80 redux.sync.add, pay one online-softmax
+//           rescale per group. DRAM 49%→82% of peak at identical occupancy.
+//
 // LIMITATIONS.  seq_q == 1; HEAD_DIM ∈ {64, 128} (must be %32). Per-token scales,
 // same convention as the prefill kernel: sQ[bh], sK[bh*S+j], sV[bh*S+j].
 
 #include <cuda_fp16.h>
 #include <math.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 #ifndef DECODE_WARPS_PER_BLOCK
 #define DECODE_WARPS_PER_BLOCK 4
@@ -46,6 +54,18 @@
 // V, p·sV broadcast by shuffle). See OPTIMIZATION_LOG iter 15.
 #ifndef INT8_DECODE_DP4A
 #define INT8_DECODE_DP4A 1
+#endif
+
+// D=128 partial-kernel selector. 0 = original lane-per-dim (one position at a
+// time: 1-word K load → 6-shuffle score reduction → softmax → V fma, a serial
+// chain that leaves the memory pipe idle — ncu: 49% DRAM, 73% long_scoreboard).
+// 1 = batched lane-per-dim (iter 21): process NB positions per group — issue
+// all NB K loads back-to-back (NB× the bytes in flight), reduce each dot with
+// one sm_80 `redux.sync.add` instead of the 6-shuffle tree, and pay ONE
+// online-softmax rescale (corr __expf + acc scaling) per group instead of per
+// position. Same lane-per-dim layout → all K/V loads stay fully coalesced.
+#ifndef INT8_DECODE_BATCH
+#define INT8_DECODE_BATCH 1
 #endif
 
 // ── Pass 1: per-(b,h, split) partial online-softmax over one KV chunk ──────
@@ -217,6 +237,140 @@ __global__ void int8_decode_partial_dp4a_kernel(
         p_acc[(size_t)unit * HEAD_DIM + base + i] = acc[i];
 }
 
+// ── Pass 1 (batched variant, D=128): lane-per-dim, NB positions per group ──
+// The original lane-per-dim kernel is a serial per-position chain
+//   (1-word K load → 6-shuffle reduce → expf/rescale → V fma)
+// so at most one K row is ever in flight per warp and the warp stalls on
+// long_scoreboard 73% of issue slots (ncu, B64 H16 S8K). This variant keeps the
+// coalesced lane-per-dim layout (lane owns DPL=4 dims → each lane's DPL bytes of
+// a row are ONE int32, the warp's loads are one contiguous 128 B line) but
+// restructures the loop into groups of NB positions:
+//   phase 1: issue all NB K-word loads + NB sK/sV scalar loads (independent),
+//            then NB dp4a partial dots, each reduced with ONE redux.sync.add
+//            (sm_80) instead of a 6-step shuffle tree;
+//   phase 2: ONE online-softmax update for the whole group (group max in
+//            registers — scores are already warp-uniform after redux — one
+//            corr __expf, one acc rescale, NB weight __expf's);
+//   phase 3: issue all NB V char4 loads, then NB fma-accumulates.
+// Requires DPL == 4 (HEAD_DIM == 128). D=64 keeps the dp4a lane-per-position
+// kernel (its NW=16 register footprint is the measured optimum there).
+template <int HEAD_DIM, int NB>
+__global__ void int8_decode_partial_batch_kernel(
+    const int8_t* __restrict__ Q,   // [BH, HEAD_DIM]
+    const int8_t* __restrict__ K,   // [BH, S, HEAD_DIM]
+    const int8_t* __restrict__ V,   // [BH, S, HEAD_DIM]
+    const float*  __restrict__ sQ,  // [BH]
+    const float*  __restrict__ sK,  // [BH*S]
+    const float*  __restrict__ sV,  // [BH*S]
+    float* __restrict__ p_m,        // [BH*NSPLIT]
+    float* __restrict__ p_l,        // [BH*NSPLIT]
+    float* __restrict__ p_acc,      // [BH*NSPLIT, HEAD_DIM]  (unnormalized)
+    int S, int BH, int nsplit, int chunk, float attn_scale)
+{
+    constexpr int DPL = HEAD_DIM / 32;
+    static_assert(DPL == 4, "batched lane-per-dim kernel assumes DPL==4 (D=128)");
+    const int unit = blockIdx.x * DECODE_WARPS_PER_BLOCK + threadIdx.y;
+    if (unit >= BH * nsplit) return;
+    const int bh   = unit / nsplit;
+    const int sp   = unit % nsplit;
+    const int lane = threadIdx.x;
+    const int base = lane * DPL;
+
+    const int j0 = sp * chunk;
+    const int j1 = min(S, j0 + chunk);
+
+    // This lane's DPL=4 bytes of Q as one packed int8x4 word.
+    const int qw = *reinterpret_cast<const int32_t*>(Q + (size_t)bh * HEAD_DIM + base);
+    const float sq = sQ[bh];
+
+    const int8_t* Kbh  = K  + (size_t)bh * S * HEAD_DIM;
+    const int8_t* Vbh  = V  + (size_t)bh * S * HEAD_DIM;
+    const float*  sKbh = sK + (size_t)bh * S;
+    const float*  sVbh = sV + (size_t)bh * S;
+
+    float m = -INFINITY, l = 0.0f;
+    float acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) acc[i] = 0.0f;
+
+    int j = j0;
+    for (; j + NB <= j1; j += NB) {
+        // Phase 1: batch the K-side loads (all independent → NB rows in flight).
+        int   kw [NB];
+        float skb[NB], svb[NB];
+        #pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            kw[b]  = *reinterpret_cast<const int32_t*>(
+                         Kbh + (size_t)(j + b) * HEAD_DIM + base);
+            skb[b] = sKbh[j + b];
+            svb[b] = sVbh[j + b];
+        }
+        float score[NB];
+        #pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const int dot = __reduce_add_sync(0xffffffffu, __dp4a(qw, kw[b], 0));
+            score[b] = (float)dot * sq * skb[b] * attn_scale;
+        }
+
+        // Phase 2: one online-softmax update for the whole group.
+        float gmax = score[0];
+        #pragma unroll
+        for (int b = 1; b < NB; ++b) gmax = fmaxf(gmax, score[b]);
+        const float m_new = fmaxf(m, gmax);
+        const float corr  = __expf(m - m_new);
+        float p[NB], lsum = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            p[b] = __expf(score[b] - m_new);
+            lsum += p[b];
+        }
+        l = l * corr + lsum;
+        m = m_new;
+
+        // Phase 3: batch the V loads, then accumulate.
+        char4 vc[NB];
+        #pragma unroll
+        for (int b = 0; b < NB; ++b)
+            vc[b] = *reinterpret_cast<const char4*>(
+                        Vbh + (size_t)(j + b) * HEAD_DIM + base);
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] *= corr;
+        #pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const float w = p[b] * svb[b];
+            acc[0] += w * (float)vc[b].x;
+            acc[1] += w * (float)vc[b].y;
+            acc[2] += w * (float)vc[b].z;
+            acc[3] += w * (float)vc[b].w;
+        }
+    }
+
+    // Tail (< NB positions): per-position, same redux reduction.
+    for (; j < j1; ++j) {
+        const int kwt = *reinterpret_cast<const int32_t*>(
+                            Kbh + (size_t)j * HEAD_DIM + base);
+        const int dot = __reduce_add_sync(0xffffffffu, __dp4a(qw, kwt, 0));
+        const float score = (float)dot * sq * sKbh[j] * attn_scale;
+        const float m_new = fmaxf(m, score);
+        const float corr  = __expf(m - m_new);
+        const float p     = __expf(score - m_new);
+        l = l * corr + p;
+        const char4 vc = *reinterpret_cast<const char4*>(
+                             Vbh + (size_t)j * HEAD_DIM + base);
+        const float w = p * sVbh[j];
+        acc[0] = acc[0] * corr + w * (float)vc.x;
+        acc[1] = acc[1] * corr + w * (float)vc.y;
+        acc[2] = acc[2] * corr + w * (float)vc.z;
+        acc[3] = acc[3] * corr + w * (float)vc.w;
+        m = m_new;
+    }
+
+    if (lane == 0) { p_m[unit] = m; p_l[unit] = l; }
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i)
+        p_acc[(size_t)unit * HEAD_DIM + base + i] = acc[i];
+}
+
 // ── Pass 2: merge the NSPLIT partials per (b,h) (log-sum-exp rescale) ──────
 template <int HEAD_DIM>
 __global__ void int8_decode_combine_kernel(
@@ -280,8 +434,15 @@ void int8_decode_attention_forward(
     const float attn_scale = 1.0f / sqrtf((float)head_dim);
 
     // Choose NSPLIT to target a high total warp count (fill the SMs / hide
-    // latency) without over-splitting into tiny chunks.
-    const int MIN_CHUNK = 128, TARGET_UNITS = 4096, MAX_SPLIT = 128;
+    // latency) without over-splitting into tiny chunks. TARGET_UNITS is
+    // runtime-overridable via env INT8_DECODE_TARGET_UNITS for tuning sweeps
+    // (read once per process; default = shipped value).
+    const int MIN_CHUNK = 128, MAX_SPLIT = 128;
+    static const int TARGET_UNITS = [] {
+        const char* e = getenv("INT8_DECODE_TARGET_UNITS");
+        const int v = e ? atoi(e) : 0;
+        return v > 0 ? v : 4096;
+    }();
     int nsplit = TARGET_UNITS / BH; if (nsplit < 1) nsplit = 1;
     const int by_len = (S / MIN_CHUNK) > 1 ? (S / MIN_CHUNK) : 1;
     if (nsplit > by_len)   nsplit = by_len;
@@ -315,8 +476,30 @@ void int8_decode_attention_forward(
         int8_decode_combine_kernel<64><<<gridC, block>>>(
             out, p_m, p_l, p_acc, BH, nsplit);
     } else if (head_dim == 128) {
+#if INT8_DECODE_BATCH
+        // Batched lane-per-dim partial (iter 21). NB=4 is the shipped default:
+        // it ties NB=16 on latency (within noise) at 48 regs/thread — the same
+        // occupancy as the original kernel — while NB=16 costs 80 regs
+        // (10 → 6 blocks/SM). INT8_DECODE_NB ∈ {4,8,16} (env, read once at
+        // first call) selects the other instantiations for tuning sweeps.
+        static const int NB = [] {
+            const char* e = getenv("INT8_DECODE_NB");
+            const int v = e ? atoi(e) : 4;
+            return (v == 4 || v == 8 || v == 16) ? v : 4;
+        }();
+        if (NB == 4)
+            int8_decode_partial_batch_kernel<128, 4><<<gridP, block>>>(
+                Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+        else if (NB == 16)
+            int8_decode_partial_batch_kernel<128, 16><<<gridP, block>>>(
+                Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+        else
+            int8_decode_partial_batch_kernel<128, 8><<<gridP, block>>>(
+                Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+#else
         int8_decode_partial_kernel<128><<<gridP, block>>>(
             Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+#endif
         int8_decode_combine_kernel<128><<<gridC, block>>>(
             out, p_m, p_l, p_acc, BH, nsplit);
     }
