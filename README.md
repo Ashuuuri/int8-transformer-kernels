@@ -68,7 +68,7 @@ it but removes a round-trip is a win.
 | Comparison (equal-or-fairer peer) | Result |
 |---|---|
 | vs **FP16 SDPA** | **WIN at every shape, both head dims** (batched lane-per-dim, iters 21–22): D=64 **1.45–1.89×** at serving scale (B≥32; even B=8 wins 1.10–1.31×), D=128 **1.74–1.82×**, at **half the KV bytes** |
-| vs **FlashInfer FP8** decode (same 1 byte/elem KV) | D=64 **WIN outright, 1.14–1.48×**; D=128 **par** 0.89–1.07× (wins ≤8K ctx, −10% at ≥16K). Both **more accurate** (cos 0.99995 vs 0.99922). Peer-version sensitive: measured vs flashinfer **0.6.14**; the 0.6.12 snapshot was ~18% slower at some shapes |
+| vs **FlashInfer FP8** decode (same 1 byte/elem KV) | D=64 **WIN outright, 1.14–1.48×**; D=128 **par** 0.89–1.07× (wins ≤8K ctx, −10% at ≥16K). Both **more accurate** (cos 0.99995 vs 0.99922). Two fairness notes, measured: (a) peer version — vs flashinfer **0.6.14**; 0.6.12 was ~18% slower at some shapes; (b) FlashInfer serves **paged** KV (PAGE=16, the vLLM-style production config) while ours is contiguous — re-measured at PAGE=256 the paging tax (~3–12%) narrows things: D=64 win holds (1.14–1.31×), D=128 reads 0.86–0.88× |
 | vs **FlashInfer FP16** (well-tuned, 2 bytes/elem) | **1.45–1.74×** (the structural half-bytes win) |
 
 Our INT8 decode now **beats the production FP8 SOTA outright at D=64 and
@@ -109,8 +109,8 @@ the fix.)
 
 INT8 (attention core + MLP, with LayerNorm/residual/projections kept FP16) wins
 **only** in the bandwidth-bound long-context **decode** regime (crosses 1.0× at
-~8K context, up to **1.19× @ 32K**) and loses in compute-bound prefill — fully
-consistent with every per-kernel result.
+~4K context, up to **1.51× @ 32K** after the iter-21/22 decode kernels) and
+loses in compute-bound prefill — fully consistent with every per-kernel result.
 
 ---
 

@@ -392,7 +392,21 @@ the structure that later let the occupancy analysis conclude the well is dry.
 - **Conclusion**: one kernel structure (batched lane-per-dim, NB=4) is now the
   dispatched optimum for both head dims; iter 15's dp4a is superseded. The
   decode story vs the production FP8 SOTA is now **win at D=64, par at D=128**,
-  at equal KV bytes and higher accuracy. Remaining decode headroom: D=128
+  at equal KV bytes and higher accuracy.
+- **Downstream refresh + fairness bounds** (same day):
+  - `bench_block.py` re-run with the new decode kernels: the end-to-end block
+    decode crossover moves **~8K → ~4K** context and S=32K improves
+    **1.19× → 1.51×** vs the FP16 block (prefill unchanged, 0.54×).
+  - **Paging-tax bound**: FlashInfer serves *paged* KV (PAGE=16 — the
+    vLLM-style production config) while our kernel is contiguous. Re-measured
+    at PAGE=256 the FP8 peer speeds up ~3–12%: the D=64 win holds
+    (1.14–1.31×), but D=128 reads **0.86–0.88×** — i.e. part of the D=128
+    "par" at PAGE=16 is the peer's paging overhead. Recorded in the README
+    claim table; the honest D=128 statement is "par in the production paged
+    config, ~-13% against an unpaged FP8 bound".
+  - SDPA-baseline sanity: PyTorch 2.7 auto-dispatches decode SDPA to the
+    FLASH_ATTENTION backend (within 6% of the best backend at the probed
+    shape) — the FP16 baseline is not a crippled strawman. Remaining decode headroom: D=128
   long-context (−10% at S≥16K) and the ~60% `long_scoreboard` still left at
   D=64 (~65% of roof) — likely needs cp.async smem staging or deeper NB with
   a register diet; diminishing returns vs pivoting to producer fusion.
