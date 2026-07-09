@@ -82,8 +82,8 @@ peers pay a software-dequant tax. (Effective KV bandwidth: ~0.95 TB/s at D=64,
 
 ![Decode vs a real quantized-KV SOTA (FlashInfer FP8, equal KV bytes)](docs/figures/decode_sota.png)
 
-> Left: vs FlashInfer FP8 at **equal 1 byte/elem KV** — par at both head dims
-> (D=128 wins ≤8K ctx). Middle: vs FlashInfer FP16 (2× the KV bytes). Right: at equal
+> Left: vs FlashInfer FP8 at **equal 1 byte/elem KV** — D=64 wins outright,
+> D=128 par. Middle: vs FlashInfer FP16 (2× the KV bytes). Right: at equal
 > bytes our **per-token INT8** scales are **more accurate** than FP8's per-tensor
 > scale (cos 0.99995 vs 0.99922).
 

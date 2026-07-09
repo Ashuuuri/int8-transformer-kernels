@@ -146,7 +146,7 @@ def hero_accuracy(ax, block):
     ax.set_ylim(max(0.995, lo), 1.0005)
     ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=7.5, rotation=0)
     ax.set_ylabel("cosine vs FP32 reference")
-    ax.set_title("Accuracy preserved end-to-end (cos ≥ 0.9986)")
+    ax.set_title("Accuracy preserved end-to-end (cos ≥ 0.9985)")
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(color=D.C_FP16, label="prefill"),
                        Patch(color=D.C_OURS, label="decode")],
