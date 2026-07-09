@@ -358,3 +358,8 @@ the structure that later let the occupancy analysis conclude the well is dry.
   respond to the same batching treatment: its lane-per-position layout makes
   K reads 64 B-strided per lane, so the fix there is likely cp.async smem
   staging or a hybrid — a separate iteration.
+- **Journey chart**: `figures/make_roofline.py` renders the whole arc on an
+  A100 roofline (`results/figures/roofline.png`, embedded in the README) —
+  decode's iter-14→15→21 climb toward the INT8-KV roof, the FP16-SDPA
+  "already at its roof" wedge that motivates the byte thesis, and the
+  compute-bound prefill/MLP points honestly below theirs.

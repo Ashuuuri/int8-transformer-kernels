@@ -45,6 +45,15 @@ moved / kernel launches**, never by a stall-counter for its own sake. A change
 that raises tensor-pipe % but adds an HBM round-trip is a loss; one that lowers
 it but removes a round-trip is a win.
 
+![A100 roofline — the INT8 journey](docs/figures/roofline.png)
+
+> The thesis on one chart (regenerate with `python figures/make_roofline.py`).
+> Left: prefill/MLP live on the compute-bound side of the ridge where INT8
+> bytes can't help; decode lives at ~2 OPs/byte where they're everything.
+> Right: FP16 SDPA already runs at ~87% of its roof — the only way past it is
+> **more intensity** (INT8 KV halves the bytes → 2× the ceiling), and the
+> iter-15/21 kernel work climbs to 51% / 78% of the raised roof.
+
 ---
 
 ## Headline results (A100-SXM4-40GB)
@@ -136,6 +145,7 @@ bench/                       latency/throughput + profiling drivers
 
 figures/                     plotting (read results/*.csv -> results/figures/*.png)
   make_figures.py            clean seaborn figure set (hero + themed)
+  make_roofline.py           A100 roofline of the optimization journey (thesis chart)
   make_dashboard.py          legacy dashboard + shared plot/data/byte-model helpers
 
 common/                      shared primitives, imported by the above
