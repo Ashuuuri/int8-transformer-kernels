@@ -27,12 +27,12 @@
 // (consecutive lanes read consecutive dims). Barrier-free → stays bandwidth-
 // bound, which is what makes the INT8 KV-cache win show up.
 //
-// DISPATCH (host, empirically best per head_dim):
-//   D=64  → dp4a lane-per-position (iter 15);
-//   D=128 → batched lane-per-dim, NB=4 positions/group (iter 21): batch the
-//           K/V loads for NB positions (NB rows in flight per warp), reduce
-//           each dot with one sm_80 redux.sync.add, pay one online-softmax
-//           rescale per group. DRAM 49%→82% of peak at identical occupancy.
+// DISPATCH (host): BOTH head dims run the batched lane-per-dim partial with
+// NB=4 positions/group (iters 21–22): batch the K/V loads for NB positions
+// (NB rows in flight per warp), reduce each dot with one sm_80 redux.sync.add,
+// pay one online-softmax rescale per group. DRAM 49%→82% (D=128) and
+// 48%→63% (D=64) of peak at identical occupancy. dp4a lane-per-position
+// (iter 15) is superseded at D=64; kept behind INT8_DECODE_BATCH64=0.
 //
 // LIMITATIONS.  seq_q == 1; HEAD_DIM ∈ {64, 128} (must be %32). Per-token scales,
 // same convention as the prefill kernel: sQ[bh], sK[bh*S+j], sV[bh*S+j].
@@ -252,8 +252,25 @@ __global__ void int8_decode_partial_dp4a_kernel(
 //            registers — scores are already warp-uniform after redux — one
 //            corr __expf, one acc rescale, NB weight __expf's);
 //   phase 3: issue all NB V char4 loads, then NB fma-accumulates.
-// Requires DPL == 4 (HEAD_DIM == 128). D=64 keeps the dp4a lane-per-position
-// kernel (its NW=16 register footprint is the measured optimum there).
+// Supports DPL == 4 (HEAD_DIM == 128, dp4a dots) and DPL == 2 (HEAD_DIM == 64,
+// two-IMAD dots) — iter 22 extends the same structure to D=64.
+template <bool C, class A, class Bt> struct cond            { using type = A; };
+template <class A, class Bt>         struct cond<false, A, Bt> { using type = Bt; };
+
+__device__ __forceinline__ int lane_dot(int32_t q, int32_t k) {
+    return __dp4a(q, k, 0);
+}
+__device__ __forceinline__ int lane_dot(char2 q, char2 k) {
+    return (int)q.x * (int)k.x + (int)q.y * (int)k.y;
+}
+__device__ __forceinline__ void acc_add(float* acc, char4 v, float w) {
+    acc[0] += w * (float)v.x; acc[1] += w * (float)v.y;
+    acc[2] += w * (float)v.z; acc[3] += w * (float)v.w;
+}
+__device__ __forceinline__ void acc_add(float* acc, char2 v, float w) {
+    acc[0] += w * (float)v.x; acc[1] += w * (float)v.y;
+}
+
 template <int HEAD_DIM, int NB>
 __global__ void int8_decode_partial_batch_kernel(
     const int8_t* __restrict__ Q,   // [BH, HEAD_DIM]
@@ -268,7 +285,12 @@ __global__ void int8_decode_partial_batch_kernel(
     int S, int BH, int nsplit, int chunk, float attn_scale)
 {
     constexpr int DPL = HEAD_DIM / 32;
-    static_assert(DPL == 4, "batched lane-per-dim kernel assumes DPL==4 (D=128)");
+    static_assert(DPL == 4 || DPL == 2,
+                  "batched lane-per-dim kernel supports D=128 (DPL=4) and D=64 (DPL=2)");
+    // This lane's DPL bytes of a row load as one word: int8x4 for D=128 (a
+    // full dp4a operand), char2 for D=64 (two IMADs).
+    using kword_t = typename cond<DPL == 4, int32_t, char2>::type;
+    using vword_t = typename cond<DPL == 4, char4,   char2>::type;
     const int unit = blockIdx.x * DECODE_WARPS_PER_BLOCK + threadIdx.y;
     if (unit >= BH * nsplit) return;
     const int bh   = unit / nsplit;
@@ -279,8 +301,7 @@ __global__ void int8_decode_partial_batch_kernel(
     const int j0 = sp * chunk;
     const int j1 = min(S, j0 + chunk);
 
-    // This lane's DPL=4 bytes of Q as one packed int8x4 word.
-    const int qw = *reinterpret_cast<const int32_t*>(Q + (size_t)bh * HEAD_DIM + base);
+    const kword_t qw = *reinterpret_cast<const kword_t*>(Q + (size_t)bh * HEAD_DIM + base);
     const float sq = sQ[bh];
 
     const int8_t* Kbh  = K  + (size_t)bh * S * HEAD_DIM;
@@ -296,11 +317,11 @@ __global__ void int8_decode_partial_batch_kernel(
     int j = j0;
     for (; j + NB <= j1; j += NB) {
         // Phase 1: batch the K-side loads (all independent → NB rows in flight).
-        int   kw [NB];
-        float skb[NB], svb[NB];
+        kword_t kw [NB];
+        float   skb[NB], svb[NB];
         #pragma unroll
         for (int b = 0; b < NB; ++b) {
-            kw[b]  = *reinterpret_cast<const int32_t*>(
+            kw[b]  = *reinterpret_cast<const kword_t*>(
                          Kbh + (size_t)(j + b) * HEAD_DIM + base);
             skb[b] = sKbh[j + b];
             svb[b] = sVbh[j + b];
@@ -308,7 +329,7 @@ __global__ void int8_decode_partial_batch_kernel(
         float score[NB];
         #pragma unroll
         for (int b = 0; b < NB; ++b) {
-            const int dot = __reduce_add_sync(0xffffffffu, __dp4a(qw, kw[b], 0));
+            const int dot = __reduce_add_sync(0xffffffffu, lane_dot(qw, kw[b]));
             score[b] = (float)dot * sq * skb[b] * attn_scale;
         }
 
@@ -328,40 +349,33 @@ __global__ void int8_decode_partial_batch_kernel(
         m = m_new;
 
         // Phase 3: batch the V loads, then accumulate.
-        char4 vc[NB];
+        vword_t vc[NB];
         #pragma unroll
         for (int b = 0; b < NB; ++b)
-            vc[b] = *reinterpret_cast<const char4*>(
+            vc[b] = *reinterpret_cast<const vword_t*>(
                         Vbh + (size_t)(j + b) * HEAD_DIM + base);
         #pragma unroll
         for (int i = 0; i < DPL; ++i) acc[i] *= corr;
         #pragma unroll
-        for (int b = 0; b < NB; ++b) {
-            const float w = p[b] * svb[b];
-            acc[0] += w * (float)vc[b].x;
-            acc[1] += w * (float)vc[b].y;
-            acc[2] += w * (float)vc[b].z;
-            acc[3] += w * (float)vc[b].w;
-        }
+        for (int b = 0; b < NB; ++b)
+            acc_add(acc, vc[b], p[b] * svb[b]);
     }
 
     // Tail (< NB positions): per-position, same redux reduction.
     for (; j < j1; ++j) {
-        const int kwt = *reinterpret_cast<const int32_t*>(
-                            Kbh + (size_t)j * HEAD_DIM + base);
-        const int dot = __reduce_add_sync(0xffffffffu, __dp4a(qw, kwt, 0));
+        const kword_t kwt = *reinterpret_cast<const kword_t*>(
+                                Kbh + (size_t)j * HEAD_DIM + base);
+        const int dot = __reduce_add_sync(0xffffffffu, lane_dot(qw, kwt));
         const float score = (float)dot * sq * sKbh[j] * attn_scale;
         const float m_new = fmaxf(m, score);
         const float corr  = __expf(m - m_new);
         const float p     = __expf(score - m_new);
         l = l * corr + p;
-        const char4 vc = *reinterpret_cast<const char4*>(
-                             Vbh + (size_t)j * HEAD_DIM + base);
-        const float w = p * sVbh[j];
-        acc[0] = acc[0] * corr + w * (float)vc.x;
-        acc[1] = acc[1] * corr + w * (float)vc.y;
-        acc[2] = acc[2] * corr + w * (float)vc.z;
-        acc[3] = acc[3] * corr + w * (float)vc.w;
+        const vword_t vc = *reinterpret_cast<const vword_t*>(
+                               Vbh + (size_t)j * HEAD_DIM + base);
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] *= corr;
+        acc_add(acc, vc, p * sVbh[j]);
         m = m_new;
     }
 
@@ -466,6 +480,32 @@ void int8_decode_attention_forward(
     //                  so the original lane-per-dim split-KV (1.23×) stays.
     // INT8_DECODE_DP4A=0 forces the original D=64 path too (A/B / ablation).
     if (head_dim == 64) {
+        // D=64 ships the batched lane-per-dim kernel too (iter 22): NB=4 wins
+        // every serving shape vs dp4a (−15…−22%, 813 → 1036 GB/s @ S=32K) —
+        // dp4a's lane-per-position K reads are 64 B-strided per lane, batching
+        // restores coalesced lines with NB rows in flight. dp4a stays for
+        // ablation: env INT8_DECODE_BATCH64=0 (or compile INT8_DECODE_DP4A=0
+        // for the original lane-per-dim per-position path).
+        static const int batch64 = [] {
+            const char* e = getenv("INT8_DECODE_BATCH64");
+            return e ? atoi(e) : 1;
+        }();
+        static const int NB64 = [] {
+            const char* e = getenv("INT8_DECODE_NB");
+            const int v = e ? atoi(e) : 4;
+            return (v == 4 || v == 8 || v == 16) ? v : 4;
+        }();
+        if (batch64) {
+            if (NB64 == 4)
+                int8_decode_partial_batch_kernel<64, 4><<<gridP, block>>>(
+                    Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+            else if (NB64 == 16)
+                int8_decode_partial_batch_kernel<64, 16><<<gridP, block>>>(
+                    Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+            else
+                int8_decode_partial_batch_kernel<64, 8><<<gridP, block>>>(
+                    Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);
+        } else
 #if INT8_DECODE_DP4A
         int8_decode_partial_dp4a_kernel<64><<<gridP, block>>>(
             Q, K, V, sQ, sK, sV, p_m, p_l, p_acc, S, BH, nsplit, chunk, attn_scale);

@@ -45,7 +45,7 @@ Target hardware: A100-SXM4-40GB, `sm_80`, CUDA 12.8, system PyTorch 2.7.
 | File | Purpose |
 |---|---|
 | `kernels/int8_attention.cu` | INT8 **prefill** attention (seq_q == seq_kv). INT8 WMMA QK^T (s32 accum) + FP16 WMMA PV, per-token scales, online softmax, templated on `(TILE_KV, HEAD_DIM)`. |
-| `kernels/int8_decode_attention.cu` | INT8 **decode** attention (seq_q == 1). Split-KV flash-decoding (per-chunk partial online-softmax + log-sum-exp combine), warp-per-(b,h,split), barrier-free. Host dispatches the best partial per head_dim: **D=64 → `dp4a` lane-per-position**, **D=128 → batched lane-per-dim** (NB=4 positions/group, `redux.sync` dot reduce, one softmax rescale per group — iter 21). Ablation flags: `INT8_DECODE_DP4A=0` (original D=64 path), `INT8_DECODE_BATCH=0` (original per-position D=128 path); env `INT8_DECODE_NB`∈{4,8,16}, `INT8_DECODE_TARGET_UNITS` for tuning sweeps. |
+| `kernels/int8_decode_attention.cu` | INT8 **decode** attention (seq_q == 1). Split-KV flash-decoding (per-chunk partial online-softmax + log-sum-exp combine), warp-per-(b,h,split), barrier-free. **Both head dims dispatch the batched lane-per-dim partial** (NB=4 positions/group, `redux.sync` dot reduce, one softmax rescale per group — iters 21–22). Ablation: env `INT8_DECODE_BATCH64=0` (D=64 back to iter-15 dp4a), compile `INT8_DECODE_BATCH=0` (D=128 back to per-position), `INT8_DECODE_DP4A=0` (original D=64 lane-per-dim); env `INT8_DECODE_NB`∈{4,8,16}, `INT8_DECODE_TARGET_UNITS` for tuning sweeps. |
 | `kernels/int8_mlp.cu` | INT8 MLP. 128×128-tile INT8 WMMA ×2, GELU fused into GEMM1, dynamic per-token quant. Entry points: `int8_mlp_forward` (per-tensor scalar scales, legacy/unchanged), `int8_mlp_forward_per_channel` (per-token act + per-channel weight + per-token output — the real-model accuracy path), `int8_mlp_forward_prepacked` (transpose-once static-weight path; what `bench/sweep.py` grades). |
 | `kernels/int8_common.cuh` | Shared device helpers: GELU, f32→i8, cp.async. |
 | `kernels/quant_utils.cu` | Per-tensor quantize/dequantize utilities. |
@@ -184,8 +184,11 @@ is not on this list (full evidence in `OPTIMIZATION.md`):
   register prefetch (`INT8_ATTN_VPREFETCH`).
 
 **Decode:**
-- `dp4a` @ D=128 is a do-not-retry (register-pressure regression). D=64 → dp4a,
-  D=128 → **batched lane-per-dim** (iter 21) is the dispatched optimum.
+- the **batched lane-per-dim partial (NB=4) is the dispatched optimum for BOTH
+  head dims** (iters 21–22). dp4a lane-per-position (iter 15) is superseded at
+  D=64 (kept behind `INT8_DECODE_BATCH64=0`); full-row `dp4a` @ D=128 remains a
+  do-not-retry (register-pressure regression). NB=8/16 tie-or-lose to NB=4 at
+  both dims while costing residency — don't re-grind the NB axis.
 - the occupancy lever is CLOSED (iter 20): 48 regs × 128 threads caps residency
   at 10 blocks/SM; raising `TARGET_UNITS` only queues more blocks (neutral,
   median-of-5). Latency must be hidden per-warp (more loads in flight), which
@@ -203,14 +206,14 @@ is not on this list (full evidence in `OPTIMIZATION.md`):
 
 In priority order:
 
-1. **Decode D=64 batching** — iter 21 closed the D=128 gap (0.59–0.75× →
-   0.89–1.07× vs FlashInfer FP8) but D=64 dp4a still runs at 48% DRAM with 89%
-   `long_scoreboard` — the same disease iter 21 cured at D=128. The dp4a
-   lane-per-position layout makes K reads 64 B-strided per lane, so the fix is
-   likely cp.async smem staging (K tile is contiguous 2 KB → coalesced async
-   copy) rather than register batching. Also: D=128 long-context (S≥16K) still
-   trails FP8 ~10%; NB=16 / TARGET_UNITS=16384 each buy ~1–2% there — a
-   long-S-only dispatch tweak is a cheap probe.
+1. **Decode residual headroom (diminishing)** — after iters 21–22 the decode
+   kernels sit at ~65% (D=64) / ~78% (D=128) of the memory roof, win vs FP8 at
+   D=64 and par at D=128. What's left: D=128 long-context (−10% vs FP8 at
+   S≥16K; NB=16 / TARGET_UNITS=16384 each buy ~1–2% — a long-S-only dispatch
+   tweak is a cheap probe) and D=64's remaining 60% `long_scoreboard` (likely
+   cp.async smem staging for K tiles, or deeper NB with a register diet).
+   Weigh against pivoting: producer fusion (below) probably buys more
+   end-to-end.
 2. **End-to-end producer-fusion** — the eager-mode quant/dequant glue at inter-op
    boundaries (~0.68 ms of the prefill block) is the one fusion lever per-kernel
    work can't reach: fuse the quantize into the *producer* (LayerNorm→int8 emit;

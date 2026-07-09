@@ -52,7 +52,8 @@ it but removes a round-trip is a win.
 > bytes can't help; decode lives at ~2 OPs/byte where they're everything.
 > Right: FP16 SDPA already runs at ~87% of its roof — the only way past it is
 > **more intensity** (INT8 KV halves the bytes → 2× the ceiling), and the
-> iter-15/21 kernel work climbs to 51% / 78% of the raised roof.
+> iter 14→15→21→22 kernel work climbs to 65% (D=64) / 78% (D=128) of the
+> raised roof.
 
 ---
 
@@ -66,15 +67,16 @@ it but removes a round-trip is a win.
 
 | Comparison (equal-or-fairer peer) | Result |
 |---|---|
-| vs **FP16 SDPA**, serving scale (B≥32) | **WIN** both head dims: D=64 **1.04–1.47×** (`dp4a`), D=128 **1.75–1.82×** (batched lane-per-dim, iter 21), at **half the KV bytes** |
-| vs **FlashInfer FP8** decode (same 1 byte/elem KV) | **par at both head dims and more accurate** (cos 0.99995 vs 0.99922): D=64 0.80–1.16×, D=128 0.89–1.07× (wins ≤8K ctx, −10% at ≥16K). Peer-version sensitive: measured vs flashinfer **0.6.14**; the 0.6.12 snapshot was ~18% slower at some shapes |
-| vs **FlashInfer FP16** (well-tuned, 2 bytes/elem) | ~**1.04–1.75×** (the structural half-bytes win, honestly smaller than vs the weaker SDPA baseline) |
+| vs **FP16 SDPA** | **WIN at every shape, both head dims** (batched lane-per-dim, iters 21–22): D=64 **1.45–1.89×** at serving scale (B≥32; even B=8 wins 1.10–1.31×), D=128 **1.74–1.82×**, at **half the KV bytes** |
+| vs **FlashInfer FP8** decode (same 1 byte/elem KV) | D=64 **WIN outright, 1.14–1.48×**; D=128 **par** 0.89–1.07× (wins ≤8K ctx, −10% at ≥16K). Both **more accurate** (cos 0.99995 vs 0.99922). Peer-version sensitive: measured vs flashinfer **0.6.14**; the 0.6.12 snapshot was ~18% slower at some shapes |
+| vs **FlashInfer FP16** (well-tuned, 2 bytes/elem) | **1.45–1.74×** (the structural half-bytes win) |
 
-At **both head dims** our INT8 decode is par with the **production FP8 SOTA at
-equal KV bandwidth, and more accurate** — so the win is real *kernel quality*,
-not merely "quantized vs unquantized". On Ampere, INT8 is the *right* quantized
-format: `sm_80` has no FP8 tensor cores, so FP8 peers pay a software-dequant tax.
-(D=128 reaches ~1.30 TB/s effective KV bandwidth, ~84% of the A100-40GB HBM peak.)
+Our INT8 decode now **beats the production FP8 SOTA outright at D=64 and
+matches it at D=128 — at equal KV bandwidth, and more accurate** — so the win
+is real *kernel quality*, not merely "quantized vs unquantized". On Ampere,
+INT8 is the *right* quantized format: `sm_80` has no FP8 tensor cores, so FP8
+peers pay a software-dequant tax. (Effective KV bandwidth: ~0.95 TB/s at D=64,
+~1.18 TB/s at D=128 — 61–76% of the A100-40GB HBM peak.)
 
 ![Decode vs a real quantized-KV SOTA (FlashInfer FP8, equal KV bytes)](docs/figures/decode_sota.png)
 

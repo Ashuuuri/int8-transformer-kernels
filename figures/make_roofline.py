@@ -81,10 +81,12 @@ def main():
 
     # Historical journey points (documented in OPTIMIZATION.md):
     #  - iter 14: D=64 split-KV v2 ran at ~390 GB/s (lane-per-dim, shuffle-bound).
+    #  - iter 15→21 published snapshot: D=64 dp4a measured 5.771 ms here.
     #  - iter 21: the D=128 lane-per-dim baseline measured 10.204 ms at this
     #    shape (median of 5) immediately before the batched kernel landed.
     d64_v1_ms = _decode_bytes_int8(64) / 390e9 * 1e3
     d64_v1    = _pt(_decode_flops(64),  _decode_bytes_int8(64),  d64_v1_ms)
+    d64_dp4a  = _pt(_decode_flops(64),  _decode_bytes_int8(64),  5.771)
     d128_v0   = _pt(_decode_flops(128), _decode_bytes_int8(128), 10.204)
 
     # Compute-side points from the sweeps (graded head_dim=64 attention shape;
@@ -134,8 +136,8 @@ def main():
                  mlp_pt, xytext=(mlp_pt[0] * 0.78, mlp_pt[1] * 1.9),
                  fontsize=8.6, color=INK, ha="right", va="center")
 
-    for p, c in [(sdpa_ref, MUTED), (d64_v1, GREEN), (d64_now, GREEN),
-                 (d128_v0, BLUE), (d128_now, BLUE)]:
+    for p, c in [(sdpa_ref, MUTED), (d64_v1, GREEN), (d64_dp4a, GREEN),
+                 (d64_now, GREEN), (d128_v0, BLUE), (d128_now, BLUE)]:
         axL.plot(*p, "o", color=c, ms=5, zorder=5)
     zoom = mpatches.Rectangle((0.80, 0.52), 1.85, 2.85, fill=False,
                               edgecolor=MUTED, lw=1.1, ls="--", zorder=4)
@@ -189,17 +191,20 @@ def main():
     # FP16 reference (left of the wedge)
     dotR(sdpa_ref, MUTED, "FP16 SDPA decode", (0.60, 0.72), note=pct(sdpa_ref))
 
-    # D=64 journey — labels in the lower-right open space
-    dotR(d64_v1,  GREEN, "D=64 split-KV v1 (iter 14)", (2.02, 0.42),
+    # Journey labels stack on the right, ordered by their point's height so
+    # the leader lines never cross.
+    dotR(d64_v1,   GREEN, "D=64 split-KV v1 (iter 14)", (2.02, 0.40),
          note=pct(d64_v1))
-    dotR(d64_now, GREEN, "D=64 dp4a (iter 15)", (2.02, 1.06), note=pct(d64_now))
-    climbR(d64_v1, d64_now, GREEN)
-
-    # D=128 journey — labels stacked above the D=64 ones
-    dotR(d128_v0,  BLUE, "D=128 lane-per-dim (iters 14–20)", (2.02, 1.62),
+    dotR(d64_dp4a, GREEN, "D=64 dp4a (iter 15)", (2.02, 0.98),
+         note=pct(d64_dp4a))
+    dotR(d128_v0,  BLUE, "D=128 lane-per-dim (iters 14–20)", (2.02, 1.52),
          note=pct(d128_v0))
-    dotR(d128_now, BLUE, "D=128 batched (iter 21)", (2.02, 2.55),
+    dotR(d64_now,  GREEN, "D=64 batched (iter 22)", (2.02, 2.06),
+         note=pct(d64_now))
+    dotR(d128_now, BLUE, "D=128 batched (iter 21)", (2.02, 2.62),
          note=pct(d128_now))
+    climbR(d64_v1, d64_dp4a, GREEN)
+    climbR(d64_dp4a, d64_now, GREEN)
     climbR(d128_v0, d128_now, BLUE)
 
     axR.set_xlim(0.55, 2.55)

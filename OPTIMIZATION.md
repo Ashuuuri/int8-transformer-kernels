@@ -38,6 +38,7 @@ behind the distilled, still-actionable conclusions in
 | 19 | 2026-06-13 | accuracy | Gate 5 runs the real INT8 MLP kernel in GPT-2 | real ppl +0.134% (< 2% bar) |
 | 20 | 2026-07-09 | decode | TARGET_UNITS occupancy sweep (first decode `ncu`) | **NEUTRAL** — reg-capped at 10 blocks/SM; occupancy lever closed |
 | 21 | 2026-07-09 | decode | batched lane-per-dim partial (D=128) | **WIN** −26…−35%; vs SDPA 1.19→1.75–1.82×; vs FP8 0.59–0.75→0.89–1.07× |
+| 22 | 2026-07-09 | decode | batched lane-per-dim extended to D=64 (replaces dp4a) | **WIN** −15…−22%; vs SDPA 1.04–1.47→1.10–1.89×; vs FP8 **1.14–1.48× (outright win)** |
 
 ---
 
@@ -363,3 +364,35 @@ the structure that later let the occupancy analysis conclude the well is dry.
   decode's iter-14→15→21 climb toward the INT8-KV roof, the FP16-SDPA
   "already at its roof" wedge that motivates the byte thesis, and the
   compute-bound prefill/MLP points honestly below theirs.
+
+### Iteration 22 — decode: batched lane-per-dim extended to D=64 (dp4a superseded)
+- **Hypothesis**: the shipped D=64 dp4a path had the same disease iter 21 cured
+  at D=128 — 48% DRAM, **89%** `long_scoreboard` — but a different anatomy: its
+  lane-per-position layout makes each lane read a whole 64 B K row as 16
+  64 B-strided 4 B words (16× the LSU wavefronts of a coalesced access), and
+  only ~1 row is in flight per warp.
+- **Change** (`int8_decode_attention.cu`): generalized
+  `int8_decode_partial_batch_kernel` to DPL=2 (`char2` K/V words, two-IMAD
+  lane dot via a `lane_dot` overload; same `redux.sync.add` reduction, same
+  one-rescale-per-group softmax). Host now routes **both** head dims to the
+  batched kernel with NB=4; the dp4a path stays for ablation
+  (`INT8_DECODE_BATCH64=0`). NB=4 again ties/beats NB=8/16 at 48 regs
+  (58/89 regs) — the same "batch just enough, keep residency" optimum.
+- **Profiling** (B64 H16 S8192): DRAM **48% → 63%**, `long_scoreboard`
+  **89% → 60%**, occupancy unchanged (54% warps, 48 regs).
+- **Result** (median of 5, tune harness): −15…−22% across serving shapes
+  (S=32K B64H16: 5.282 → 4.148 ms, 813 → 1036 GB/s). Published-bench sweep:
+  - **vs FP16 SDPA**: B≥32 **1.45–1.89×** (was 1.04–1.47×); even the
+    grid-starved B=8 rows flip from **0.80–0.98× (loss) to 1.10–1.31× (win)** —
+    batching restores in-flight bytes exactly where few warps are resident.
+  - **vs FlashInfer FP8 0.6.14** (equal 1 B/elem KV): **1.14–1.48× — an
+    outright win at every D=64 shape** (was 0.80–1.16× par). D=128 rows
+    unchanged (0.89–1.07×, regression-checked).
+- **Gates**: all 5 PASS; 16-case decode edge harness PASS (cos = 1.000000).
+- **Conclusion**: one kernel structure (batched lane-per-dim, NB=4) is now the
+  dispatched optimum for both head dims; iter 15's dp4a is superseded. The
+  decode story vs the production FP8 SOTA is now **win at D=64, par at D=128**,
+  at equal KV bytes and higher accuracy. Remaining decode headroom: D=128
+  long-context (−10% at S≥16K) and the ~60% `long_scoreboard` still left at
+  D=64 (~65% of roof) — likely needs cp.async smem staging or deeper NB with
+  a register diet; diminishing returns vs pivoting to producer fusion.

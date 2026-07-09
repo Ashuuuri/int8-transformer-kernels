@@ -339,7 +339,7 @@ def main():
                 "Decode vs a real quantized-KV SOTA (FlashInfer FP8, equal KV bytes)",
                 lambda ax: (
                     panel_sota_speedup(ax[0], dsota, "spd_vs_fp8",
-                        "vs FP8 SOTA — par at both head dims (D=128 wins ≤8K)",
+                        "vs FP8 SOTA — D=64 wins outright, D=128 par",
                         "speedup vs FlashInfer FP8 (>1 = ours faster)"),
                     panel_sota_speedup(ax[1], dsota, "spd_vs_fp16",
                         "vs FP16 (FlashInfer, 2× the KV bytes)",
