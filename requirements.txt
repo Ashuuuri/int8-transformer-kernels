@@ -1,0 +1,19 @@
+# Snapshot environment: A100 (sm_80), CUDA 12.8, Python 3.12.
+# PyTorch is assumed preinstalled (system torch 2.7 built for cu128) and is
+# deliberately not pinned here -- install the wheel matching your CUDA.
+# System packages: `apt install pybind11-dev` (headers for cpp_extension.load).
+
+# build + benches
+ninja
+numpy
+matplotlib
+seaborn
+
+# Gate 5: real GPT-2 perplexity on WikiText-2 (validate_int8.py SKIPs Gate 5 without these)
+transformers
+datasets
+
+# bench/bench_decode_sota.py: FlashInfer FP8/FP16 decode peer.
+# Pinned: peer version moves the FP8 ratios by up to ~18% (0.6.12 vs 0.6.14);
+# the committed results/ snapshot was measured against 0.6.14.
+flashinfer-python==0.6.14

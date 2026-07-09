@@ -1,0 +1,27 @@
+# Compile-check the CUDA kernels on every push -- no GPU needed, nvcc -c only.
+# int8_ext.cu is excluded: it needs the torch/pybind11 headers and is covered
+# by the JIT build in tests/validation (which require an A100 and run locally).
+name: build-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  nvcc-compile:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: nvcc compile (sm_80) + ptxas register/spill report
+        run: |
+          nvcc --version
+          set -e
+          for f in kernels/int8_attention.cu \
+                   kernels/int8_decode_attention.cu \
+                   kernels/int8_mlp.cu \
+                   kernels/quant_utils.cu; do
+            echo "== $f"
+            nvcc -arch=sm_80 -O3 --std=c++17 --ptxas-options=-v -c "$f" -o /dev/null
+          done

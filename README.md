@@ -1,5 +1,7 @@
 # int8-transformer-kernels
 
+[![build-check](https://github.com/Ashuuuri/int8-transformer-kernels/actions/workflows/build-check.yml/badge.svg)](https://github.com/Ashuuuri/int8-transformer-kernels/actions/workflows/build-check.yml)
+
 Fused **INT8 transformer inference kernels** for the NVIDIA A100 (`sm_80`,
 CUDA 12.8) — attention (prefill **and** decode) and MLP — written in CUDA with
 WMMA / `mma.sync` tensor-core paths and `dp4a`, exposed to PyTorch via
@@ -171,7 +173,10 @@ docs/figures/                curated showcase figures used in this README
 Environment: A100 (`sm_80`), CUDA 12.8, system PyTorch 2.7. The INT8 extension
 JIT-builds via `torch.utils.cpp_extension.load`, which needs **ninja** and the
 **pybind11 C++ headers on the system include path** — see CLAUDE.md §"Environment
-setup" for the exact one-time install (`ninja` + `pybind11-dev`).
+setup" for the exact one-time install (`ninja` + `pybind11-dev`). Python
+dependencies: `pip install -r requirements.txt` (PyTorch itself is assumed
+present, matching your CUDA). CI runs a GPU-free `nvcc -arch=sm_80` compile
+check on every push (`.github/workflows/build-check.yml`).
 
 ```bash
 # pure-CUDA smoke test
